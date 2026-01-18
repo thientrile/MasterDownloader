@@ -12,6 +12,7 @@ import instaloader
 import browser_cookie3
 from PIL import Image
 import imagehash
+from cryptography.fernet import Fernet
 from colorama import init, Fore, Style
 
 # --- FIX LỖI HIỂN THỊ TIẾNG VIỆT TRÊN WINDOWS ---
@@ -48,8 +49,13 @@ class MasterDownloader:
             compress_json=False,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
         )
+        
+        # Crypto setup
+        self.key_file = os.path.join(self.data_dir, "secret.key")
+        self.cipher = self._load_crypto_key()
+        
         self.ig_credentials_file = os.path.join(self.data_dir, "ig_credentials.txt")
-        self.manual_cookie_file = os.path.join(self.data_dir, "manual_cookie.txt")
+        self.cookies_file = os.path.join(self.data_dir, "cookies.json")
         self.ig_username = None  # Nho username da nhap de khong hoi lai
         self.ig_password = None  # Luu password da nhap lan dau
         self.ig_logged_in = False
@@ -62,6 +68,78 @@ class MasterDownloader:
         self.ig_max_posts = 30  # Gioi han so bai tai moi lan de giam risk (None de khong gioi han)
         self.history = self.load_history()
         self.migrate_archives()
+        self.migrate_security()
+
+    def migrate_security(self):
+        """Auto-encrypt plain text credentials on startup."""
+        # 1. Credentials
+        if os.path.exists(self.ig_credentials_file):
+            try:
+                with open(self.ig_credentials_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                # Simple check: Fernet tokens are usually long and start with gAAAA
+                if not content.startswith("gAAAA"):
+                    # It's likely plain text
+                    print("🔒 Encrypting legacy credentials file...")
+                    self.save_credentials(content.splitlines()[0], content.splitlines()[1])
+            except:
+                 pass
+        
+        # 2. Cookies
+        if os.path.exists(self.cookies_file):
+            changed = False
+            try:
+                with open(self.cookies_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                for k, v in data.items():
+                    if v and not v.startswith("gAAAA"):
+                        print(f"🔒 Encrypting legacy cookie for {k}...")
+                        data[k] = self._encrypt_text(v)
+                        changed = True
+                
+                if changed:
+                    with open(self.cookies_file, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+            except:
+                pass
+
+    def _load_crypto_key(self):
+        """Load or create encryption key."""
+        if os.path.exists(self.key_file):
+            try:
+                with open(self.key_file, "rb") as kf:
+                    key = kf.read()
+                return Fernet(key)
+            except:
+                pass # Re-create if corrupt
+        
+        # Create new key
+        key = Fernet.generate_key()
+        try:
+            with open(self.key_file, "wb") as kf:
+                kf.write(key)
+        except:
+            pass # Fail silently if cannot write
+        return Fernet(key)
+
+    def _encrypt_text(self, text):
+        if not text: return ""
+        try:
+            # Need to handle if text is already encrypted? No, we trust caller.
+            # But wait, if we are saving, we invoke this.
+            return self.cipher.encrypt(text.encode('utf-8')).decode('utf-8')
+        except Exception as e:
+            print(f"Encryption error: {e}")
+            return text
+
+    def _decrypt_text(self, text):
+        if not text: return ""
+        try:
+            return self.cipher.decrypt(text.encode('utf-8')).decode('utf-8')
+        except Exception:
+            # Fallback if text is not encrypted (migration support)
+            return text
 
     def migrate_archives(self):
         """Move legacy downloaded.txt files to new centralized archives folder."""
@@ -155,6 +233,10 @@ class MasterDownloader:
             print(f"{Fore.YELLOW}⚠️  Reset download archive that bai {archive_path!r}: {e}")
             return False
 
+    def _read_manual_cookie_deprecated(self):
+        """Helper to read and clean manual cookie string. DEPRECATED."""
+        return self.get_manual_cookie("instagram") or self.get_manual_cookie("tiktok")
+
     def _prepare_yt_dlp(self, ydl_opts, label):
         """Build a YoutubeDL instance with resilient archive handling."""
         opts = dict(ydl_opts)
@@ -221,39 +303,82 @@ class MasterDownloader:
             return None
         try:
             with open(self.ig_credentials_file, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-                if len(lines) >= 2:
-                    return lines[0].strip(), lines[1].strip()
+                content = f.read().strip()
+                
+            # Try to decrypt entire content
+            decrypted = self._decrypt_text(content)
+            
+            # If decryption worked or it was plain text, we expect lines
+            lines = decrypted.splitlines()
+            if len(lines) >= 2:
+                # If it was migrated, re-save encrypted immediately?
+                # Best to just return.
+                return lines[0].strip(), lines[1].strip()
         except Exception:
             return None
         return None
 
     def save_credentials(self, username, password):
         try:
+            content = f"{username}\n{password}"
+            encrypted = self._encrypt_text(content)
             with open(self.ig_credentials_file, "w", encoding="utf-8") as f:
-                f.write(f"{username}\n{password}\n")
+                f.write(encrypted)
         except Exception:
             pass
 
-    def load_session_from_manual_file(self):
-        """Doc cookie tu file manual_cookie.txt (dinh dang raw HTTP header)"""
-        if not os.path.exists(self.manual_cookie_file):
-            return False
-            
-        print(f"{Fore.CYAN}🔄 Dang nap cookie tu file manual_cookie.txt...")
+    def get_manual_cookie(self, platform):
+        """Get cookie string for platform (instagram/tiktok) from json file."""
+        if not os.path.exists(self.cookies_file):
+            return None
         try:
-            with open(self.manual_cookie_file, "r", encoding="utf-8") as f:
-                cookie_data = f.read().strip()
+            with open(self.cookies_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                cookie_encrypted = data.get(platform, "")
+                if not cookie_encrypted: return None
                 
-            if not cookie_data:
-                return False
+                # Decrypt here
+                cookie = self._decrypt_text(cookie_encrypted)
+                
+                return cookie.strip('"').strip("'").replace('\n', '').strip()
+        except:
+            return None
 
-            # Xoa ky tu ngoac kep thua o dau/cuoi neu co
-            cookie_data = cookie_data.strip('"').strip("'")
-            
+    def set_manual_cookie(self, platform, cookie_content):
+        """Save cookie string for platform."""
+        data = {}
+        if os.path.exists(self.cookies_file):
+             try:
+                 with open(self.cookies_file, 'r', encoding='utf-8') as f:
+                     data = json.load(f)
+             except: pass
+        
+        # Encrypt before saving
+        data[platform] = self._encrypt_text(cookie_content)
+        
+        try:
+            with open(self.cookies_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error saving cookie: {e}")
+            return False
+
+    def load_session_from_manual_file(self):
+        """Doc cookie tu cookies.json (dinh dang raw HTTP header)"""
+        print(f"{Fore.CYAN}🔄 Dang nap cookie IG tu cookies.json...")
+        
+        cookie_data = self.get_manual_cookie("instagram")
+        if not cookie_data:
+            return False
+
+        try:
             # Reset cookie jar de dam bao sach se
             self.ig.context._session.cookies.clear()
             
+            user_id_val = None
+            csrf_token_val = None
+
             # --- PARSE COOKIES INTO JAR (SUA LOI: KHONG DUNG HEADER TRUC TIEP) ---
             # Parse chuoicookie vao cookie jar de requests tu dong quan ly (cap nhat csrf, version...)
             # Format: name=value; name2=value2
@@ -329,7 +454,6 @@ class MasterDownloader:
             # Test thu xem login duoc khong (fallback neu khong tim thay user_id)
             print(f"{Fore.CYAN}👉 Dang kiem tra login voi Manual Cookie (khong tim thay User ID)...")
             username = self.ig.test_login()
-            username = self.ig.test_login()
             if username:
                 self.ig_username = username
                 self.ig.save_session_to_file(filename=self.session_file_path(username))
@@ -337,7 +461,7 @@ class MasterDownloader:
                 print(f"{Fore.GREEN}✅ Da nap thanh cong Manual Cookies cho user: {username}")
                 return True
             else:
-                print(f"{Fore.RED}❌ Cookie trong file manual_cookie.txt khong hop le hoac da het han.")
+                print(f"{Fore.RED}❌ Cookie IG trong cookies.json khong hop le.")
                 return False
 
         except Exception as e:
@@ -416,13 +540,54 @@ class MasterDownloader:
             print(f"{Fore.RED}❌ Loi dang nhap: {e}")
             return False
 
-    def download_tiktok(self, url, output_folder=None):
+    def _handle_ydl_progress(self, d, progress_callback):
+        """Helper to handle yt-dlp progress hooks via callback."""
+        if d['status'] == 'downloading':
+            percent = d.get('_percent_str', '').strip()
+            speed = d.get('_speed_str', '').strip()
+            eta = d.get('_eta_str', '').strip()
+            msg = f"{percent} | {speed} | ETA: {eta}"
+            print(f"{Fore.YELLOW}📥 {msg}", end='\r')
+            if progress_callback:
+                progress_callback(percent, msg)
+        elif d['status'] == 'finished':
+            msg = "Đang xử lý file..."
+            print(f"\n{Fore.GREEN}✅ {msg}")
+            if progress_callback:
+                progress_callback("100%", msg)
+
+    def _create_temp_cookie_file(self, cookie_string, domain=".tiktok.com"):
+        """Creates a temporary Netscape cookie file from a cookie string."""
+        if not cookie_string: return None
+        
+        try:
+            temp_file = os.path.join(self.data_dir, "temp_cookies.txt")
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                f.write("# This file was generated by MasterDownloader\n")
+                
+                parts = cookie_string.split(';')
+                for part in parts:
+                    if '=' not in part: continue
+                    key, val = part.split('=', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    # DOMAIN FLAG PATH SECURE EXPIRY NAME VALUE
+                    f.write(f"{domain}\tTRUE\t/\tFALSE\t2147483647\t{key}\t{val}\n")
+            return temp_file
+        except:
+            return None
+
+    def download_tiktok(self, url, output_folder=None, progress_callback=None):
         """Xử lý tải TikTok (Video/Photo)"""
-        url = url.split('?')[0].strip()
+        # Giữ nguyên tham số URL vì Story có thể cần tham số để định danh chính xác
+        # url = url.split('?')[0].strip() 
+        url = url.strip()
+        
         if "/photo/" in url:
             url = url.replace("/photo/", "/video/")
             
-        match = re.search(r'@([^/]+)', url)
+        match = re.search(r'@([^/?]+)', url)
         username = match.group(1) if match else "Unknown"
         
         # Tao thu muc rieng cho user (uu tien lay tu history neu co)
@@ -435,7 +600,7 @@ class MasterDownloader:
             
         archive = os.path.join(self.archive_dir, f"tiktok_{username}.txt")
         
-        ydl_opts = {
+        ydl_opts_base = {
             'format': 'bestvideo+bestaudio/best',
             'outtmpl': os.path.join(folder, '%(upload_date)s - %(title|No Title).100s [%(id)s] - %(playlist_index)s.%(ext)s'),
             'download_archive': archive,
@@ -447,20 +612,78 @@ class MasterDownloader:
             }],
             'quiet': False,
             'no_warnings': True,
+            'force_ipv4': True, # Fix loi 403 CDN TikTok
+            'sleep_interval': 5, # Doi 5s giua cac lan tai video
+            'max_sleep_interval': 15, # Random toi da 15s
+            'sleep_interval_requests': 2, # Doi 2s giua cac request API (tranh 429 khi lay list video)
+            # Setup User-Agent mac dinh cua yt-dlp thuong tot hon hardcode
+            # 'http_headers': {
+            #     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            # },
             # Thanh tien trinh don gian cho TikTok
             'progress_hooks': [
-                lambda d: print(
-                    f"{Fore.YELLOW}📥 Dang tai: {d.get('_percent_str','?')} - {d.get('_speed_str','?')}",
-                    end='\r'
-                ) if d.get('status') == 'downloading' else None
+                lambda d: self._handle_ydl_progress(d, progress_callback)
             ],
         }
 
         print(f"{Fore.CYAN}🚀 Dang quet TikTok cua: {username}")
-        with self._prepare_yt_dlp(ydl_opts, f"TikTok {username}") as ydl:
-            ydl.download([url])
+        if progress_callback: progress_callback("0%", "Đang lấy thông tin...")
 
-    def download_instagram(self, url, output_folder=None):
+        manual_cookie = self.get_manual_cookie("tiktok")
+        
+        # Chien luoc: 1. Manual Cookie File (Uu tien so 1) -> 2. Browser -> 3. No Cookie
+        strategies = []
+        
+        if manual_cookie:
+            # Create temp netscape cookie file
+            temp_cookie_path = self._create_temp_cookie_file(manual_cookie)
+            if temp_cookie_path:
+                strategies.append(("Manual Cookie", {'cookiefile': temp_cookie_path}))
+            
+        strategies.append(("Browser Cookies", {'cookiesfrombrowser': ('edge',)}))
+        strategies.append(("No Cookies", {}))
+
+        for label, extra_opts in strategies:
+            opts = ydl_opts_base.copy()
+            opts.update(extra_opts)
+            
+            try:
+                if label == "Manual Cookie":
+                    print(f"{Fore.CYAN}🍪 Dang dung Manual Cookie tu settings...")
+                elif label == "Browser Cookies":
+                    # Kiem tra xem co manual cookie khong, neu co ma loi thi moi qua day, in log cho ro
+                    print(f"{Fore.CYAN}ℹ️  Dang thu lay cookie tu Edge...")
+                
+                with self._prepare_yt_dlp(opts, f"TikTok {username}") as ydl:
+                    ydl.download([url])
+                
+                # Neu chay OK ma khong loi thi thoat vong lap chien luoc
+                break 
+
+            except Exception as e:
+                err_msg = str(e)
+                # Check loi permission (do mo trinh duyet) hoac loi load cookie
+                is_cookie_error = "Permission denied" in err_msg or "CookieLoadError" in err_msg or "Could not copy" in err_msg
+                
+                if is_cookie_error:
+                    if label == "Browser Cookies":
+                        print(f"{Fore.YELLOW}⚠️  Khong doc duoc cookie Edge (do dang mo). Bo qua.")
+                    else:
+                         print(f"{Fore.RED}❌ Loi cookie: {e}")
+                    continue 
+
+                # Check loi 429
+                if "429" in err_msg or "Too Many Requests" in err_msg:
+                    print(f"{Fore.RED}❌ Bi TikTok chan (429) o che do {label}.")
+                    if label == "Manual Cookie":
+                         print(f"{Fore.YELLOW}👉 Cookie thu cong co ve da het han hoac bi chan.")
+                    continue
+                
+                # Cac loi khac thi raise luon
+                print(f"{Fore.RED}❌ Loi TikTok: {e}")
+                raise e
+
+    def download_instagram(self, url, output_folder=None, progress_callback=None):
         """Xử lý tải Instagram Profile/Post"""
         url = url.split('?')[0].strip('/')
         target = url.split('/')[-1]
@@ -525,6 +748,7 @@ class MasterDownloader:
 
             # --- TẢI STORY (Added Feature) ---
             print(f"{Fore.MAGENTA}🎞️  Dang quet & tai Stories...")
+            if progress_callback: progress_callback("Wait", "Đang quét Stories...")
             try:
                 # Lay stories cua user hien tai (can login)
                 if self.ig_logged_in:
@@ -533,10 +757,33 @@ class MasterDownloader:
                     for story in stories:
                         for item in story.get_items():
                             has_story = True
+                            
+                            # Check Metadata History (Story ID)
+                            story_id = str(item.mediaid)
+                            if story_id in downloaded_shortcodes:
+                                continue
+
                             # download_storyitem tra ve True neu tai moi
-                            if self.ig.download_storyitem(item, target=target):
+                            downloaded = self.ig.download_storyitem(item, target=target)
+                            
+                            # Luu vao history
+                            if downloaded:
                                 print(f"{Fore.GREEN}   + Da tai story moi: {item.date_local}")
+                                try:
+                                    with open(archive_path, 'a', encoding='utf-8') as f:
+                                        f.write(f"{story_id}\n")
+                                    downloaded_shortcodes.add(story_id)
+                                except: pass
                                 time.sleep(random.uniform(2, 5))
+                            else:
+                                # Mark as downloaded if file exists but not in history
+                                # (Optional, but good for consistency)
+                                if story_id not in downloaded_shortcodes:
+                                    try:
+                                        with open(archive_path, 'a', encoding='utf-8') as f:
+                                            f.write(f"{story_id}\n")
+                                        downloaded_shortcodes.add(story_id)
+                                    except: pass
                     
                     if not has_story:
                         print(f"{Fore.YELLOW}   ℹ️  Khong co story nao (hoac khong xem duoc).")
@@ -584,12 +831,16 @@ class MasterDownloader:
                         
                         # --- CHECK HISTORY ---
                         if post.shortcode in downloaded_shortcodes:
-                            print(f"{Fore.YELLOW}🛡️  [Post {post_count}] Da tai truoc do (History db). Dung quet.           ")
+                            msg = f"Đã tải {post.shortcode} (History)"
+                            print(f"{Fore.YELLOW}🛡️  [Post {post_count}] {msg}           ")
+                            if progress_callback: progress_callback("Skipped", msg)
                             break
                         # ---------------------
 
                         # Hien thi tien trinh (overwrite line)
-                        print(f"{Fore.CYAN}⏳ [Post {post_count}] Dang kiem tra: {post.shortcode}...", end='\r')
+                        msg_check = f"Đang kiểm tra: {post.shortcode}..."
+                        print(f"{Fore.CYAN}⏳ [Post {post_count}] {msg_check}", end='\r')
+                        if progress_callback: progress_callback(f"Post {post_count}", msg_check)
                         
                         try:
                             # download_post trả về True nếu tải mới, False nếu bài đã tồn tại
@@ -604,7 +855,9 @@ class MasterDownloader:
                                 print(f"{Fore.RED}❌ Loi ghi history: {e}")
 
                             if downloaded:
-                                print(f"{Fore.GREEN}✅ [Post {post_count}] Da tai xong: {post.date_local} ({post.shortcode})     ")
+                                msg_done = f"Đã tải xong: {post.shortcode}"
+                                print(f"{Fore.GREEN}✅ [Post {post_count}] {msg_done}     ")
+                                if progress_callback: progress_callback(f"Post {post_count}", "Tải xong")
                                 wait_time = random.uniform(*self.ig_sleep_range)
                                 time.sleep(wait_time)
                             else:
@@ -638,7 +891,7 @@ class MasterDownloader:
         except Exception as e:
             print(f"{Fore.RED}❌ Loi khi quet Profile: {e}")
 
-    def download_facebook(self, url, output_folder=None):
+    def download_facebook(self, url, output_folder=None, progress_callback=None):
         """Xử lý tải Facebook video/post"""
         url = url.split('?')[0].strip()
         match = re.search(r"facebook\.com/([^/?#]+)", url, re.IGNORECASE)
@@ -668,14 +921,12 @@ class MasterDownloader:
             'quiet': False,
             'no_warnings': True,
             'progress_hooks': [
-                lambda d: print(
-                    f"{Fore.YELLOW}📥 FB: {d.get('_percent_str','?')} - {d.get('_speed_str','?')}",
-                    end='\r'
-                ) if d.get('status') == 'downloading' else None
+                lambda d: self._handle_ydl_progress(d, progress_callback)
             ],
         }
 
         print(f"{Fore.CYAN}🚀 Dang tai Facebook cua: {username}")
+        if progress_callback: progress_callback("0%", "Đang lấy thông tin...")
         with self._prepare_yt_dlp(ydl_opts, f"Facebook {username}") as ydl:
             ydl.download([url])
 

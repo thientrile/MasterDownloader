@@ -32,3 +32,6 @@ gui_config.json
 .vscode/
 
 build
+
+cookies.json
+temp_cookies.txt

@@ -1,761 +1,793 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import json
-import os
 import sys
-import threading
-import re
+import os
 import queue
+import traceback
+import time
+import json
+import re
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal, pyqtSlot, Qt, QTimer
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, 
+                             QLabel, QFileDialog, QMessageBox, QProgressBar, QGroupBox, 
+                             QPlainTextEdit, QLineEdit, QSplitter, QTabWidget, QFormLayout, QMenu)
+from PyQt6.QtGui import QColor, QFont, QIcon, QAction
+
+# Import existing logic
 from MasterDownloader import MasterDownloader
 
-# --- ANSI Code cleaning for GUI Log ---
-# We will now PARSE ANSI instead of stripping it
-ANSI_REGEX = re.compile(r'(\x1b\[[0-9;]*m)')
+# --- WORKER SIGNALS ---
+class WorkerSignals(QObject):
+    """
+    Defines the signals available from a running worker thread.
+    Supported signals are:
+    finished: No data
+    error: tuple (exctype, value, traceback.format_exc() )
+    result: object data returned from processing, anything
+    progress: tuple (row_id, percent_str, speed_str, status_msg)
+    """
+    finished = pyqtSignal()
+    error = pyqtSignal(tuple)
+    result = pyqtSignal(object)
+    progress = pyqtSignal(tuple)
 
-class RedirectText:
-    def __init__(self, text_widget, queue):
-        self.text_widget = text_widget
-        self.queue = queue
+# --- WORKER (RUNNABLE) ---
+class DownloadWorker(QRunnable):
+    """
+    Worker thread for downloading.
+    """
+    def __init__(self, fn, row_id, *args, **kwargs):
+        super(DownloadWorker, self).__init__()
+        self.fn = fn
+        self.row_id = row_id
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+        
+        # Inject progress callback into kwargs
+        self.kwargs['progress_callback'] = self.report_progress
 
-    def write(self, string):
-        if string:
-            self.queue.put(string)
+    def report_progress(self, percent, msg):
+        # percent can be "45%" or just "45"
+        # msg can include speed, eta, etc.
+        self.signals.progress.emit((self.row_id, percent, "", msg))
 
-    def flush(self):
-        pass
-
-class FolderSelectionDialog(tk.Toplevel):
-    def __init__(self, parent, folders):
-        super().__init__(parent)
-        self.title("Chọn thư mục quét ảnh")
-        self.geometry("500x350")
-        self.result = None
-        self.folders = folders
-        
-        # Make modal
-        self.transient(parent)
-        self.grab_set()
-        
-        self.create_widgets()
-        
-        # Center on parent
-        self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{x}+{y}")
-        
-    def create_widgets(self):
-        ttk.Label(self, text="Chọn một thư mục từ danh sách đã lưu hoặc duyệt tìm:", font=("Segoe UI", 10, "bold")).pack(pady=10, padx=10, anchor="w")
-        
-        # Listbox with Scrollbar
-        frame_list = ttk.Frame(self)
-        frame_list.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        self.listbox = tk.Listbox(frame_list, font=("Segoe UI", 10), height=8)
-        self.listbox.pack(side="left", fill="both", expand=True)
-        
-        scrollbar = ttk.Scrollbar(frame_list, orient="vertical", command=self.listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.listbox.config(yscrollcommand=scrollbar.set)
-        
-        # Populate
-        for f in self.folders:
-            self.listbox.insert("end", f)
-            
-        if self.folders:
-            self.listbox.selection_set(0)
-            
-        # Bind double click
-        self.listbox.bind("<Double-1>", lambda e: self.on_select())
-            
-        # Buttons
-        btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill="x", padx=10, pady=15)
-        
-        ttk.Button(btn_frame, text="📂 Duyệt thư mục khác...", command=self.on_browse).pack(side="left")
-        
-        ttk.Button(btn_frame, text="Hủy", command=self.on_cancel).pack(side="right", padx=(5, 0))
-        ttk.Button(btn_frame, text="✅ Chọn Quyét", command=self.on_select, style="Accent.TButton").pack(side="right")
-        
-    def on_browse(self):
-        d = filedialog.askdirectory(title="Chọn thư mục")
-        if d:
-            self.result = d
-            self.destroy()
-            
-    def on_select(self):
-        sel = self.listbox.curselection()
-        if sel:
-            self.result = self.listbox.get(sel[0])
-            self.destroy()
+    @pyqtSlot()
+    def run(self):
+        try:
+            result = self.fn(*self.args, **self.kwargs)
+        except:
+            traceback.print_exc()
+            exctype, value = sys.exc_info()[:2]
+            self.signals.error.emit((exctype, value, traceback.format_exc()))
         else:
-            messagebox.showwarning("Chưa chọn", "Vui lòng chọn một thư mục hoặc bấm Duyệt.")
-            
-    def on_cancel(self):
-        self.destroy()
+            self.signals.result.emit(result)
+        finally:
+            self.signals.finished.emit()
 
-class App(tk.Tk):
+class DuplicateWorker(QRunnable):
+    """
+    Worker thread for scanning duplicates.
+    """
+    def __init__(self, downloader, directory):
+        super(DuplicateWorker, self).__init__()
+        self.downloader = downloader
+        self.directory = directory
+        self.signals = WorkerSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            def callback(msg):
+                # We use row_id = -1 to indicate log-only progress
+                self.signals.progress.emit((-1, "0", "", msg))
+
+            results = self.downloader.scan_for_duplicates(
+                directory=self.directory, 
+                remove=True, 
+                status_callback=callback
+            )
+            self.signals.result.emit(results)
+        except:
+            traceback.print_exc()
+            exctype, value = sys.exc_info()[:2]
+            self.signals.error.emit((exctype, value, traceback.format_exc()))
+        finally:
+            self.signals.finished.emit()
+
+# --- MAIN WINDOW ---
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowTitle("Master Downloader Ultimate (PyQt6)")
+        self.resize(1100, 750)
         
-        # Initialize Downloader Logic IMMEDIATELY to avoid AttributeError later
-        # This fixes the issue where create_widgets -> load_settings calls self.downloader before it exists.
+        # Logic Core
         self.downloader = MasterDownloader()
+        self.threadpool = QThreadPool()
+        print(f"Multimedia Thread Pool running with {self.threadpool.maxThreadCount()} threads.")
 
-        self.title("Master Downloader Ultimate Manager")
-        self.geometry("950x700")
+        self.row_mapping = {} # future/uid -> row_index (Dynamic management)
+        # Since table rows can change index if we sort or delete, better to store an ID in the item data.
+        # For simplicity in this demo, we assume append-only or carefully managed rows.
         
-        # --- THEME & STYLES ---
-        style = ttk.Style(self)
-        try:
-            # Try to use 'vista' or 'xpnative' on Windows for better look
-            style.theme_use('vista') 
-        except:
-            style.theme_use('clam') # Fallback to clam which is clean
-
-        # Global Config
-        self.configure(bg="#f0f0f0")
-        
-        # Configure Styles
-        style.configure("TFrame", background="#f0f0f0")
-        style.configure("TLabel", background="#f0f0f0", font=("Segoe UI", 10))
-        style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
-        style.configure("TLabelframe", background="#f0f0f0")
-        style.configure("TLabelframe.Label", background="#f0f0f0", font=("Segoe UI", 10, "bold"), foreground="#333")
-        
-        # Treeview Style
-        style.configure("Treeview", font=("Segoe UI", 10), rowheight=28)
-        style.configure("Treeview.Heading", font=("Segoe UI", 11, "bold"))
-        
-        # Special Accent Button Style
-        style.configure("Accent.TButton", foreground="#0066cc", font=("Segoe UI", 10, "bold"))
-
-        # Color Map for ANSI codes
-        self.ansi_map = {
-            '30': 'BLACK', '31': 'RED', '32': 'GREEN', '33': 'YELLOW',
-            '34': 'BLUE', '35': 'MAGENTA', '36': 'CYAN', '37': 'WHITE',
-            '90': 'GREY', '91': 'LRED', '92': 'LGREEN', '93': 'LYELLOW',
-            '94': 'LBLUE', '95': 'LMAGENTA', '96': 'LCYAN', '97': 'LWHITE',
-        }
-        
-        # Paths
+        # Configuration (Simple placeholder)
         if getattr(sys, 'frozen', False):
             self.base_dir = os.path.dirname(sys.executable)
         else:
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
-            
+        self.current_download_folder = self.base_dir
+        
         self.config_file = os.path.join(self.base_dir, "gui_config.json")
-        
-        # Data
         self.config = self.load_config()
-        self.log_queue = queue.Queue()
-        self.is_downloading = False
-        self.stop_event = threading.Event()
 
-        # Initialize Downloader Logic (Moved to top of __init__) - keeping this check here
-        # Override downloader base dir if user selected a custom one
-        if self.config.get("download_folder"):
-            folder = self.config["download_folder"]
-            self.downloader.base_dir = folder
-            self.downloader.data_dir = folder
-            
-            # Re-map all paths to the new folder
-            self.downloader.session_dir = os.path.join(folder, "sessions")
-            self.downloader.archive_dir = os.path.join(folder, "archives")
-            self.downloader.history_file = os.path.join(folder, "history.json")
-            self.downloader.ig_credentials_file = os.path.join(folder, "ig_credentials.txt")
-            self.downloader.manual_cookie_file = os.path.join(folder, "manual_cookie.txt")
-            
-            # Ensure dirs exist
-            os.makedirs(self.downloader.session_dir, exist_ok=True)
-            os.makedirs(self.downloader.archive_dir, exist_ok=True)
-
-        # UI Layout
-        self.create_widgets()
-        
-        # Redirect stdout
-        sys.stdout = RedirectText(self.log_area, self.log_queue)
-        sys.stderr = RedirectText(self.log_area, self.log_queue)
-        
-        # Start log polling
-        self.after(100, self.poll_log)
+        self.init_ui()
+        self.load_saved_links()
 
     def load_config(self):
-        config = {"download_folder": "", "saved_links": []}
+        default = {"download_folder": "", "saved_links": [], "default_download_folder": ""}
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    config.update(data)
+                    # Merge defaults
+                    for k, v in default.items():
+                        if k not in data:
+                            data[k] = v
+                    return data
             except:
-                pass
-        
-        # Upgrade legacy links (strings) to objects
-        new_links = []
-        for item in config["saved_links"]:
-            if isinstance(item, str):
-                new_links.append({"url": item, "folder": ""})
-            else:
-                new_links.append(item)
-        config["saved_links"] = new_links
-        return config
+                return default
+        return default
 
     def save_config(self):
         try:
             with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save config: {e}")
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+        except:
+            pass
 
-    def create_widgets(self):
-        # MAIN CONTAINER
-        main_container = ttk.Frame(self)
-        main_container.pack(fill="both", expand=True, padx=10, pady=10)
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
 
-        # --- Bottom: Logs (Moved up to reserve space at bottom) ---
-        log_frame = ttk.LabelFrame(main_container, text="Nhật ký hoạt động (Logs)", padding=(10, 5))
-        log_frame.pack(fill="x", pady=(10, 0), side="bottom")
+        # Tab Widget
+        tabs = QTabWidget()
+        main_layout.addWidget(tabs)
 
-        self.log_area = scrolledtext.ScrolledText(log_frame, state="disabled", height=8, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 10))
-        self.log_area.pack(fill="both", expand=True)
+        # --- TAB 1: DOWNLOADER ---
+        tab_download = QWidget()
+        download_layout = QVBoxLayout(tab_download)
+
+        # 1. Top Control Panel
+        top_group = QGroupBox("Add Links")
+        top_layout = QVBoxLayout()
         
-        # Configure Tags for Colors (Dracula Theme inspired)
-        self.log_area.tag_config("NORMAL", foreground="#f8f8f2")
-        self.log_area.tag_config("BLACK", foreground="#6272a4")
-        self.log_area.tag_config("RED", foreground="#ff5555")
-        self.log_area.tag_config("GREEN", foreground="#50fa7b")
-        self.log_area.tag_config("YELLOW", foreground="#f1fa8c")
-        self.log_area.tag_config("BLUE", foreground="#bd93f9")
-        self.log_area.tag_config("MAGENTA", foreground="#ff79c6")
-        self.log_area.tag_config("CYAN", foreground="#8be9fd")
-        self.log_area.tag_config("WHITE", foreground="#ffffff")
+        # Row 1: URL input
+        r1 = QHBoxLayout()
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("Paste TikTok, Instagram, or Facebook link here...")
+        r1.addWidget(self.url_input)
         
-        # Light variants
-        self.log_area.tag_config("GREY", foreground="#6272a4")
-        self.log_area.tag_config("LRED", foreground="#ff6e6e")
-        self.log_area.tag_config("LGREEN", foreground="#69ff94")
-        self.log_area.tag_config("LYELLOW", foreground="#ffffa5")
-        self.log_area.tag_config("LBLUE", foreground="#d6acff")
-        self.log_area.tag_config("LMAGENTA", foreground="#ff92d0")
-        self.log_area.tag_config("LCYAN", foreground="#a4ffff")
-        self.log_area.tag_config("LWHITE", foreground="#ffffff")
+        self.btn_paste = QPushButton("Paste Clipboard")
+        self.btn_paste.clicked.connect(self.paste_from_clipboard)
+        r1.addWidget(self.btn_paste)
+        top_layout.addLayout(r1)
 
-        # Fallback Tags
-        self.log_area.tag_config("INFO", foreground="#d4d4d4")
-        self.log_area.tag_config("ERROR", foreground="#ff5555")
-        self.log_area.tag_config("SUCCESS", foreground="#50fa7b")
-        self.log_area.tag_config("WARNING", foreground="#f1fa8c")
-
-        # NOTEBOOK (TABS) - Pack AFTER log frame so it takes remaining space
-        self.notebook = ttk.Notebook(main_container)
-        self.notebook.pack(fill="both", expand=True)
-
-        # TAB 1: DOWNLOAD MANAGER
-        self.tab_download = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(self.tab_download, text="   ⬇️ Quản lý Tải   ")
-
-        # TAB 2: CONFIGURATION
-        self.tab_config = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(self.tab_config, text="   ⚙️ Cấu hình   ")
-
-        # --- BUILD TABS ---
-        self.create_download_tab_content(self.tab_download)
-        self.create_config_tab_content(self.tab_config)
-
-    def create_download_tab_content(self, parent_frame):
-        # --- Top: Global Folder Selection (Default) ---
-        top_frame = ttk.LabelFrame(parent_frame, text="Thư mục gốc (Mặc định)", padding=(15, 10))
-        top_frame.pack(fill="x", pady=(0, 10))
-
-        self.lbl_folder = ttk.Label(top_frame, text=self.config.get("download_folder") or "Mặc định (theo script)", font=("Segoe UI", 10, "italic"))
-        self.lbl_folder.pack(side="left", expand=True, fill="x", padx=5)
+        # Row 2: Folder input
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("Save Folder (Optional):"))
+        self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText("Default (Auto-create based on username)")
+        r2.addWidget(self.folder_input)
         
-        btn_browse = ttk.Button(top_frame, text="Thay đổi...", command=self.choose_global_folder)
-        btn_browse.pack(side="right")
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self.browse_folder)
+        r2.addWidget(btn_browse)
+        top_layout.addLayout(r2)
 
-        # --- Middle: Main Content ---
-        mid_frame = ttk.Frame(parent_frame)
-        mid_frame.pack(expand=True, fill="both", pady=5)
+        # Row 3: Buttons
+        r3 = QHBoxLayout()
+        self.btn_add = QPushButton("Download Now")
+        self.btn_add.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self.btn_add.clicked.connect(self.add_task)
+        r3.addWidget(self.btn_add)
 
-        # Left: List Management
-        left_frame = ttk.LabelFrame(mid_frame, text="Danh sách Links / Accounts", padding=(15, 10))
-        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        r3.addSpacing(20)
 
-        input_frame = ttk.Frame(left_frame)
-        input_frame.pack(fill="x", pady=(0, 10))
+        self.btn_scan = QPushButton("🧹 Clean Duplicates")
+        self.btn_scan.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.btn_scan.clicked.connect(self.scan_duplicates_ui)
+        r3.addWidget(self.btn_scan)
         
-        ttk.Label(input_frame, text="Link:").pack(side="left")
-        self.entry_link = ttk.Entry(input_frame, font=("Segoe UI", 10))
-        self.entry_link.pack(side="left", fill="x", expand=True, padx=10, ipady=4)
-        self.entry_link.bind("<Return>", lambda e: self.add_link())
+        top_layout.addLayout(r3)
+        top_group.setLayout(top_layout)
+        download_layout.addWidget(top_group)
+
+        # 2. Table Widget
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["URL / ID", "Platform", "Save Folder", "Progress", "Status", "Action", ""])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(3, 200) # Progress column width
+        self.table.setColumnWidth(6, 40)  # Delete button column width
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.open_context_menu)
+        download_layout.addWidget(self.table)
+
+        tabs.addTab(tab_download, "📥 Downloads")
+
+        # --- TAB 2: SETTINGS ---
+        tab_settings = QWidget()
+        settings_layout = QVBoxLayout(tab_settings)
+
+        # General Settings (Default Folder)
+        grp_general = QGroupBox("General Settings")
+        gen_layout = QVBoxLayout()
         
-        self.btn_pick_folder = ttk.Button(input_frame, text="📁 Chọn Lẻ", command=self.pick_single_folder)
-        self.btn_pick_folder.pack(side="left", padx=2)
-        self.single_folder_path = "" 
-
-        btn_add = ttk.Button(input_frame, text="➕ Thêm", command=self.add_link, style="Accent.TButton")
-        btn_add.pack(side="left", padx=5)
-
-        # List Area
-        list_frame = ttk.Frame(left_frame)
-        list_frame.pack(fill="both", expand=True)
-
-        columns = ("url", "folder")
-        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended", height=15)
-        self.tree.heading("url", text="URL / Username")
-        self.tree.heading("folder", text="Thư mục lưu (Tùy chọn)")
-        self.tree.column("url", width=350)
-        self.tree.column("folder", width=200)
+        lbl_def = QLabel("Default Download Folder (for new/unknown users):")
+        gen_layout.addWidget(lbl_def)
         
-        self.tree.pack(side="left", fill="both", expand=True)
+        h_def = QHBoxLayout()
+        self.txt_default_folder = QLineEdit()
+        self.txt_default_folder.setPlaceholderText("Select a folder to save videos from new users automatically...")
+        h_def.addWidget(self.txt_default_folder)
         
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.tree.config(yscrollcommand=scrollbar.set)
-
-        self.refresh_list()
-
-        # Toolbar under list
-        btn_toolbar = ttk.Frame(left_frame)
-        btn_toolbar.pack(fill="x", pady=10)
+        btn_browse_def = QPushButton("Browse...")
+        btn_browse_def.clicked.connect(self.browse_default_folder)
+        h_def.addWidget(btn_browse_def)
         
-        tk.Button(btn_toolbar, text="Xóa Đã Chọn", command=self.remove_selected, bg="#e0e0e0", relief="groove", padx=10).pack(side="left", padx=(0, 5))
-        tk.Button(btn_toolbar, text="Sửa Folder", command=self.edit_selected_folder, bg="#e0e0e0", relief="groove", padx=10).pack(side="left", padx=5)
-        tk.Button(btn_toolbar, text="Xóa Hết", command=self.clear_all, bg="#ffdddd", relief="groove", padx=10).pack(side="right")
-
-        # Right: Actions (Sidebar)
-        right_frame = ttk.LabelFrame(mid_frame, text="Bảng điều khiển", padding=(15, 10))
-        right_frame.pack(side="right", fill="y")
-
-        ttk.Label(right_frame, text="Chế độ tải:").pack(pady=(5, 10), anchor="w")
+        btn_save_def = QPushButton("💾 Save Config")
+        btn_save_def.clicked.connect(self.save_general_settings)
+        h_def.addWidget(btn_save_def)
         
-        self.btn_download_all = ttk.Button(right_frame, text="⬇️\nTẢI TẤT CẢ", command=self.start_download_all, width=15)
-        self.btn_download_all.pack(fill="x", pady=5)
+        gen_layout.addLayout(h_def)
+        grp_general.setLayout(gen_layout)
+        settings_layout.addWidget(grp_general)
+
+        # IG Credentials Group
+        grp_ig = QGroupBox("Instagram Credentials (User/Pass)")
+        form_ig = QFormLayout()
         
-        self.btn_download_selected = ttk.Button(right_frame, text="⬇️ Tải Đã Chọn", command=self.start_download_selected)
-        self.btn_download_selected.pack(fill="x", pady=(5, 5))
-
-        self.btn_stop = ttk.Button(right_frame, text="⏹️ DỪNG LẠI", command=self.stop_download, state="disabled")
-        self.btn_stop.pack(fill="x", pady=(0, 20))
-
-        ttk.Separator(right_frame, orient="horizontal").pack(fill="x", pady=10)
+        self.txt_ig_user = QLineEdit()
+        self.txt_ig_pass = QLineEdit()
+        self.txt_ig_pass.setEchoMode(QLineEdit.EchoMode.Password)
         
-        ttk.Button(right_frame, text="📂 Mở thư mục gốc", command=self.open_global_folder).pack(fill="x", pady=5)
-        ttk.Button(right_frame, text="❌ Thoát", command=self.destroy).pack(side="bottom", fill="x", pady=5)
-
-    def create_config_tab_content(self, parent_frame):
-        # Container for Configs
-        container = ttk.Frame(parent_frame)
-        container.pack(fill="both", expand=True)
-
-        # --- 1. Instagram Credentials ---
-        ig_frame = ttk.LabelFrame(container, text="🔑 Tài khoản Instagram (User/Pass)", padding=15)
-        ig_frame.pack(fill="x", pady=(0, 15))
-
-        # Grid layout for cleaner inputs
-        ig_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(ig_frame, text="Username:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.entry_ig_user = ttk.Entry(ig_frame, width=30)
-        self.entry_ig_user.grid(row=0, column=1, sticky="w", padx=5, pady=5)
-
-        ttk.Label(ig_frame, text="Password:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.entry_ig_pass = ttk.Entry(ig_frame, width=30, show="*")
-        self.entry_ig_pass.grid(row=1, column=1, sticky="w", padx=5, pady=5)
+        form_ig.addRow("Username:", self.txt_ig_user)
+        form_ig.addRow("Password:", self.txt_ig_pass)
         
-        btn_save_ig = ttk.Button(ig_frame, text="💾 Lưu Tài Khoản", command=self.save_ig_credentials)
-        btn_save_ig.grid(row=2, column=1, sticky="w", padx=5, pady=(10, 5))
+        btn_save_ig = QPushButton("💾 Save Credentials")
+        btn_save_ig.clicked.connect(self.save_ig_credentials)
+        form_ig.addRow("", btn_save_ig)
         
-        # Checkbox toggle password
-        self.var_show_pass = tk.BooleanVar(value=False)
-        chk_show = ttk.Checkbutton(ig_frame, text="Hiển thị mật khẩu", variable=self.var_show_pass, 
-                                   command=lambda: self.entry_ig_pass.config(show="" if self.var_show_pass.get() else "*"))
-        chk_show.grid(row=1, column=2, sticky="w", padx=5)
+        grp_ig.setLayout(form_ig)
+        settings_layout.addWidget(grp_ig)
 
-        # --- 2. Manual Cookies ---
-        cookie_frame = ttk.LabelFrame(container, text="🍪 Instagram Manual Cookies (Dùng khi 2FA/Lỗi)", padding=15)
-        cookie_frame.pack(fill="both", expand=True, pady=(0, 15))
+        # IG Cookies
+        grp_cookie_ig = QGroupBox("Instagram Cookie")
+        ig_layout = QVBoxLayout()
+        ig_layout.addWidget(QLabel("Paste full 'Cookie' header string for Instagram:"))
+        
+        self.txt_cookie_ig = QPlainTextEdit()
+        self.txt_cookie_ig.setPlaceholderText("csrftoken=...; ds_user_id=...; sessionid=...")
+        self.txt_cookie_ig.setMaximumHeight(80)
+        ig_layout.addWidget(self.txt_cookie_ig)
+        
+        btn_save_cookie_ig = QPushButton("💾 Save Instagram Cookie")
+        btn_save_cookie_ig.clicked.connect(lambda: self.save_manual_cookie("instagram"))
+        ig_layout.addWidget(btn_save_cookie_ig)
+        grp_cookie_ig.setLayout(ig_layout)
+        settings_layout.addWidget(grp_cookie_ig)
 
-        ttk.Label(cookie_frame, text="Dán toàn bộ Cookie string vào đây (key=value;...):").pack(anchor="w", pady=(0, 5))
+        # TikTok Cookies
+        grp_cookie_tt = QGroupBox("TikTok Cookie (For 429 Errors)")
+        tt_layout = QVBoxLayout()
+        tt_layout.addWidget(QLabel("Paste full 'Cookie' header string for TikTok:"))
         
-        self.txt_cookie = scrolledtext.ScrolledText(cookie_frame, height=8, font=("Consolas", 9))
-        self.txt_cookie.pack(fill="both", expand=True, pady=5)
+        self.txt_cookie_tt = QPlainTextEdit()
+        self.txt_cookie_tt.setPlaceholderText("tt_chain_token=...; ttwid=...; ...")
+        self.txt_cookie_tt.setMaximumHeight(80)
+        tt_layout.addWidget(self.txt_cookie_tt)
         
-        btn_save_cookie = ttk.Button(cookie_frame, text="💾 Lưu Cookie", command=self.save_cookie_manual)
-        btn_save_cookie.pack(anchor="w", pady=5)
+        btn_save_cookie_tt = QPushButton("💾 Save TikTok Cookie")
+        btn_save_cookie_tt.clicked.connect(lambda: self.save_manual_cookie("tiktok"))
+        tt_layout.addWidget(btn_save_cookie_tt)
+        grp_cookie_tt.setLayout(tt_layout)
+        settings_layout.addWidget(grp_cookie_tt)
         
-        # --- 3. Image Tools ---
-        tools_frame = ttk.LabelFrame(container, text="🛠️ Công cụ Ảnh", padding=15)
-        tools_frame.pack(fill="x", pady=(0, 15))
+        settings_layout.addStretch() # Push everything up
         
-        self.btn_scan_dupes = ttk.Button(tools_frame, text="🔍 Quét & Xoá Ảnh Trùng Lặp (Nội dung)", command=self.scan_duplicates_thread)
-        self.btn_scan_dupes.pack(anchor="w", pady=5)
-        ttk.Label(tools_frame, text="* Tính năng này sẽ quét toàn bộ thư mục tải xuống và xoá các bản sao hình ảnh.").pack(anchor="w")
-        
-        # --- Load Data on start ---
-        self.load_settings_to_ui()
+        tabs.addTab(tab_settings, "⚙️ Settings")
 
-    def load_settings_to_ui(self):
-        # Load IG Credentials
-        ig_file = self.downloader.ig_credentials_file
-        if os.path.exists(ig_file):
-            try:
-                with open(ig_file, "r", encoding="utf-8") as f:
-                    lines = f.read().splitlines()
-                    if len(lines) >= 1: self.entry_ig_user.insert(0, lines[0].strip())
-                    if len(lines) >= 2: self.entry_ig_pass.insert(0, lines[1].strip())
-            except: pass
+        # 3. Bottom Panel (Activity Log) - Shared across tabs
+        log_group = QGroupBox("Activity Log")
+        log_layout = QVBoxLayout()
+        self.log_output = QPlainTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas;")
+        log_layout.addWidget(self.log_output)
+        log_group.setLayout(log_layout)
+        
+        main_layout.addWidget(log_group)
+        
+        # Status Bar
+        self.status_bar = self.statusBar()
+        self.status_bar.showMessage("Ready")
 
-        # Load Cookie
-        cookie_file = self.downloader.manual_cookie_file
-        if os.path.exists(cookie_file):
-            try:
-                with open(cookie_file, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    self.txt_cookie.insert("1.0", content)
-            except: pass
+        # Load Settings Data on Init
+        self.load_settings_tab_data()
+
+    def load_settings_tab_data(self):
+        # Load Default Folder
+        def_folder = self.config.get("default_download_folder", "")
+        if def_folder:
+            self.txt_default_folder.setText(def_folder)
+
+        # Load IG Creds
+        creds = self.downloader.load_credentials()
+        if creds:
+            self.txt_ig_user.setText(creds[0])
+            self.txt_ig_pass.setText(creds[1])
+            
+        # Load Cookies (New JSON system)
+        ig_cookie = self.downloader.get_manual_cookie("instagram")
+        if ig_cookie:
+            self.txt_cookie_ig.setPlainText(ig_cookie)
+
+        tt_cookie = self.downloader.get_manual_cookie("tiktok")
+        if tt_cookie:
+            self.txt_cookie_tt.setPlainText(tt_cookie)
+
+    def browse_default_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Default Download Folder", self.base_dir)
+        if folder:
+            self.txt_default_folder.setText(folder)
+
+    def save_general_settings(self):
+        folder = self.txt_default_folder.text().strip()
+        self.config["default_download_folder"] = folder
+        self.save_config()
+        QMessageBox.information(self, "Saved", "General settings saved successfully.")
+        self.log(f"Default download folder updated to: {folder}", "SUCCESS")
 
     def save_ig_credentials(self):
-        user = self.entry_ig_user.get().strip()
-        pwd = self.entry_ig_pass.get().strip()
-        
+        user = self.txt_ig_user.text().strip()
+        pwd = self.txt_ig_pass.text().strip()
         if not user or not pwd:
-            messagebox.showwarning("Thiếu thông tin", "Vui lòng nhập Username và Password")
+            QMessageBox.warning(self, "Missing Info", "Please enter both username and password.")
             return
             
-        try:
-            with open(self.downloader.ig_credentials_file, "w", encoding="utf-8") as f:
-                f.write(f"{user}\n{pwd}")
-            messagebox.showinfo("Thành công", "Đã lưu thông tin tài khoản Instagram!")
-        except Exception as e:
-            messagebox.showerror("Lỗi", f"Không thể lưu file: {e}")
+        self.downloader.save_credentials(user, pwd)
+        QMessageBox.information(self, "Saved", "Instagram credentials saved successfully.")
+        self.log("Instagram credentials updated.", "SUCCESS")
 
-    def save_cookie_manual(self):
-        cookie = self.txt_cookie.get("1.0", "end-1c").strip()
+    def save_manual_cookie(self, platform):
+        if platform == "instagram":
+             cookie = self.txt_cookie_ig.toPlainText().strip()
+             label = "Instagram"
+        elif platform == "tiktok":
+             cookie = self.txt_cookie_tt.toPlainText().strip()
+             label = "TikTok"
+        else:
+             return
+
+        if self.downloader.set_manual_cookie(platform, cookie):
+            QMessageBox.information(self, "Saved", f"{label} cookie saved successfully.")
+            self.log(f"{label} cookie updated.", "SUCCESS")
+        else:
+            QMessageBox.critical(self, "Error", f"Failed to save {label} cookie.")
+
+
+    def paste_from_clipboard(self):
+        clipboard = QApplication.clipboard()
+        self.url_input.setText(clipboard.text())
+
+    def log(self, message, level="INFO"):
+        timestamp = time.strftime("%H:%M:%S")
+        color = "#d4d4d4" # INFO
+        if level == "ERROR": color = "#ff5555"
+        if level == "SUCCESS": color = "#50fa7b"
         
-        try:
-            with open(self.downloader.manual_cookie_file, "w", encoding="utf-8") as f:
-                f.write(cookie)
-            messagebox.showinfo("Thành công", "Đã lưu Cookie mới!")
-        except Exception as e:
-            messagebox.showerror("Lỗi", f"Không thể lưu file: {e}")
+        html = f'<span style="color: #6272a4;">[{timestamp}]</span> <span style="font-weight:bold; color:{color};">[{level}]</span> {message}'
+        self.log_output.appendHtml(html)
 
+    def load_saved_links(self):
+        # Load previously saved links from config
+        saved_links = self.config.get("saved_links", [])
+        if not saved_links:
+            return
 
+        self.log(f"Loading {len(saved_links)} saved links from history...", "INFO")
+        for item in saved_links:
+            url = item.get("url", "")
+            folder = item.get("folder", "")
+            if not url: continue
+            
+            # Simple platform check
+            platform = "Unknown"
+            if "tiktok" in url: platform = "TikTok"
+            elif "facebook" in url: platform = "Facebook"
+            elif "instagram" in url: platform = "Instagram"
+            
+            self.add_table_row(url, platform, folder, auto_start=False, status="History")
 
+    def add_table_row(self, url, platform, folder="", auto_start=True, status="Queued"):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        
+        # Col 0: URL
+        self.table.setItem(row, 0, QTableWidgetItem(url))
+        
+        # Col 1: Platform
+        self.table.setItem(row, 1, QTableWidgetItem(platform))
+        
+        # Col 2: Save Folder
+        self.table.setItem(row, 2, QTableWidgetItem(folder))
+        
+        # Col 3: Progress (Custom Widget)
+        p_widget = QWidget()
+        p_layout = QVBoxLayout(p_widget)
+        p_layout.setContentsMargins(5, 5, 5, 5)
+        p_layout.setSpacing(2)
+        
+        p_bar = QProgressBar()
+        p_bar.setRange(0, 100)
+        p_bar.setValue(0 if status != "Completed" else 100)
+        p_bar.setTextVisible(False)
+        p_bar.setStyleSheet("QProgressBar { border: 1px solid grey; border-radius: 3px; background-color: #e0e0e0; } QProgressBar::chunk { background-color: #2196F3; }")
+        
+        p_label = QLabel(status)
+        p_label.setStyleSheet("font-size: 10px; color: #555;")
+        p_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        p_layout.addWidget(p_bar)
+        p_layout.addWidget(p_label)
+        self.table.setCellWidget(row, 3, p_widget)
+        
+        # Col 4: Status
+        self.table.setItem(row, 4, QTableWidgetItem(status))
+        
+        # Col 5: Action
+        if auto_start:
+            btn_action = QPushButton("Stop")
+            # Logic stop unimplemented
+        else:
+            btn_action = QPushButton("Download")
+            # Use dynamic lookup to safe-guard against row shuffles/deletions
+            btn_action.clicked.connect(lambda checked, u=url, p=platform: self.trigger_download_by_url(u, p))
+            
+        self.table.setCellWidget(row, 5, btn_action)
+        
+        # Col 6: Delete
+        btn_del = QPushButton("X")
+        btn_del.setStyleSheet("background-color: #ff5555; color: white; font-weight: bold; border-radius: 2px;")
+        btn_del.setToolTip("Remove from list")
+        btn_del.clicked.connect(lambda checked, u=url: self.delete_task_by_url(u))
+        self.table.setCellWidget(row, 6, btn_del)
+        
+        if auto_start:
+            self.start_download(url, platform, row)
 
-    def poll_log(self):
-        try:
-            current_tag = "NORMAL"
-            while True:
-                text = self.log_queue.get_nowait()
-                if not text: continue
+    def find_row_by_url(self, url):
+        # Scan column 0
+        filters = self.table.findItems(url, Qt.MatchFlag.MatchExactly)
+        if filters:
+            return filters[0].row()
+        return -1
 
-                self.log_area.configure(state="normal")
+    def trigger_download_by_url(self, url, platform):
+        row = self.find_row_by_url(url)
+        if row >= 0:
+            self.start_download(url, platform, row)
+
+    def delete_task_by_url(self, url):
+        # Confirm
+        confirm = QMessageBox.question(self, "Remove Link", 
+                                     f"Remove this link from list?\n{url}",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        # 1. Update Config
+        original_count = len(self.config["saved_links"])
+        self.config["saved_links"] = [x for x in self.config["saved_links"] if x.get("url") != url]
+        if len(self.config["saved_links"]) < original_count:
+            self.save_config()
+        
+        # 2. Remove from Table
+        row = self.find_row_by_url(url)
+        if row >= 0:
+            self.table.removeRow(row)
+            self.log(f"Removed link: {url}", "INFO")
+
+    def extract_username_from_url(self, url):
+        # Clean URL
+        url = url.strip()
+        
+        # TikTok
+        match_tt = re.search(r'@([^/?]+)', url)
+        if match_tt:
+            return match_tt.group(1), "TikTok"
+            
+        # Instagram
+        if "instagram.com" in url:
+            # Handle /p/, /reels/
+            # If it's a profile: instagram.com/username/
+            # If it's a post: instagram.com/p/code/ -> We might not know username easily from URL string alone without scraping
+            # But we can try the first segment after .com/
+            parts = url.split("instagram.com/")
+            if len(parts) > 1:
+                path = parts[1].split("/")[0]
+                if path not in ["p", "reel", "reels", "stories", "explorer"]:
+                     return path, "Instagram"
+        
+        return None, "Unknown"
+
+    def resolve_folder_for_url(self, url):
+        username, platform = self.extract_username_from_url(url)
+        if not username:
+             return None, platform
+             
+        # 1. Check saved links (History) logic
+        # We look for an entry where the saved URL contains this username
+        saved_links = self.config.get("saved_links", [])
+        for item in saved_links:
+            s_url = item.get("url", "")
+            s_folder = item.get("folder", "")
+            if not s_url or not s_folder: continue
+            
+            # Simple check: if username matches?
+            s_user, _ = self.extract_username_from_url(s_url)
+            if s_user and s_user == username:
+                self.log(f"Found existing folder for user '{username}': {s_folder}", "INFO")
+                return s_folder, platform
                 
-                # Handle Carriage Return (\r) for Progress Bars
-                # If we encounter \r, we delete the current line content before writing new text
-                
-                segments = text.split('\r')
-                for i, segment in enumerate(segments):
-                    if i > 0:
-                        # If this is not the first segment, it means we hit a \r
-                        # Delete the text on the current logical line (from linestart to insert mark)
-                        self.log_area.delete("insert linestart", "insert")
-                    
-                    if not segment: continue
+        # 2. Check Default Folder
+        default_root = self.config.get("default_download_folder", "")
+        if default_root and os.path.exists(default_root):
+            # We create a subfolder for the user to keep things organized
+            # user asked "lưu trong thư mục đó luôn", but usually means inside the configured root.
+            # To be safe and organized, we append username.
+            # If user wanted flat structure, they would select specific folder.
+            # But let's follow standard downloader pattern: Root/Username
+            new_folder = os.path.join(default_root, username)
+            return new_folder, platform
+            
+        return None, platform
 
-                    parts = ANSI_REGEX.split(segment)
-                    for part in parts:
-                        if not part: continue
-                        
-                        if part.startswith('\x1b['):
-                            # Decode ANSI Code
-                            codes = part.strip('\x1b[m').split(';')
-                            for c in codes:
-                                if c == '0' or c == '39':
-                                    current_tag = "NORMAL"
-                                elif c in self.ansi_map:
-                                    current_tag = self.ansi_map[c]
-                        else:
-                            # Print Text
-                            self.log_area.insert("insert", part, current_tag)
-
-                self.log_area.see("end")
-                self.log_area.configure(state="disabled")
-                
-        except queue.Empty:
+    def add_task(self):
+        url = self.url_input.text().strip()
+        # Allow user input folder to override everything
+        user_folder = self.folder_input.text().strip()
+        
+        if not url:
+            return
+        
+        self.url_input.clear()
+        
+        # Resolve Folder and Platform
+        final_folder = user_folder
+        
+        # Identify Platform and Folder Auto-Resolution if no user folder supplied
+        resolved_folder, platform = self.resolve_folder_for_url(url)
+        
+        if not final_folder:
+            final_folder = resolved_folder
+        else:
+            # If user manually selected a folder, verify if we should save this preference?
             pass
-        self.after(50, self.poll_log) # Faster polling
 
-    def choose_global_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.config["download_folder"] = folder
-            self.lbl_folder.config(text=folder)
-            self.save_config()
-            # Update downloader path
-            self.downloader.base_dir = folder
-            self.downloader.data_dir = os.path.join(folder, "data")
-            self.downloader.session_dir = os.path.join(self.downloader.data_dir, "sessions")
-            os.makedirs(self.downloader.data_dir, exist_ok=True)
-            os.makedirs(self.downloader.session_dir, exist_ok=True)
-            print(f"✅ Đã đổi thư mục gốc sang: {folder}")
-
-    def pick_single_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.single_folder_path = folder
-            self.btn_pick_folder.config(text="✅ Đã chọn")
-
-    def refresh_list(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        if not final_folder:
+            # Still no folder? 
+            pass # MasterDownloader will handle default logic or use CWD
+            
+        # Identify Platform (fallback if resolve failed)
+        if platform == "Unknown":
+            if "tiktok" in url: platform = "TikTok"
+            elif "facebook" in url: platform = "Facebook"
+            elif "instagram" in url: platform = "Instagram"
+        
+        # Check duplicate before adding? 
+        # For now, just add
+        self.add_table_row(url, platform, final_folder if final_folder else "", auto_start=True)
+        
+        # Save to history/config
+        # We only add to "saved_links" if it's a new unique user/link of interest?
+        # Or just append everything? Original logic appended everything.
+        # But if we auto-resolved, maybe we update the entry?
+        
+        entry = {"url": url, "folder": final_folder if final_folder else ""}
+        
+        # Avoid duplicate URLs in saved_links to keep config clean?
+        # User might paste same link again.
+        exists = False
         for item in self.config["saved_links"]:
-            folder_display = item["folder"] if item["folder"] else "(Mặc định)"
-            self.tree.insert("", "end", values=(item["url"], folder_display))
-
-    def add_link(self):
-        link = self.entry_link.get().strip()
-        if link:
-            # Check duplicate
-            for item in self.config["saved_links"]:
-                if item["url"] == link:
-                    messagebox.showinfo("Info", "Link này đã có trong danh sách!")
-                    return
-
-            new_item = {"url": link, "folder": self.single_folder_path}
-            self.config["saved_links"].append(new_item)
-            self.refresh_list()
-            self.save_config()
+            if item["url"] == url:
+                item["folder"] = final_folder # Update folder preference
+                exists = True
+                break
+        
+        if not exists:
+            self.config["saved_links"].append(entry)
             
-            # Reset inputs
-            self.entry_link.delete(0, "end")
-            self.single_folder_path = ""
-            self.btn_pick_folder.config(text="📁 Chọn Lẻ")
-            
-    def remove_selected(self):
-        selection = self.tree.selection()
-        if not selection:
-            return
-        
-        # We need to map tree items back to config list
-        # Since we populate in order, index matches
-        indices = []
-        for s in selection:
-            idx = self.tree.index(s)
-            indices.append(idx)
-        
-        # Remove from backend list (reverse order)
-        for i in sorted(indices, reverse=True):
-             del self.config["saved_links"][i]
-        
-        self.refresh_list()
         self.save_config()
 
-    def edit_selected_folder(self):
-        selection = self.tree.selection()
-        if not selection:
-            return
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.base_dir)
+        if folder:
+            self.folder_input.setText(folder)
+
+    def open_context_menu(self, position):
+        menu = QMenu()
+        edit_action = QAction("Edit Save Folder", self)
+        edit_action.triggered.connect(self.edit_row_folder)
+        menu.addAction(edit_action)
+        menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def edit_row_folder(self):
+        row = self.table.currentRow()
+        if row < 0: return
+
+        current_url = self.table.item(row, 0).text()
+        current_folder = self.table.item(row, 2).text()
+
+        folder = QFileDialog.getExistingDirectory(self, "Select New Folder", current_folder or self.base_dir)
+        if folder:
+            self.table.setItem(row, 2, QTableWidgetItem(folder))
+            self.log(f"Updated folder for row {row} to: {folder}", "INFO")
+            
+            # Update Config
+            for item in self.config["saved_links"]:
+                if item["url"] == current_url:
+                    item["folder"] = folder
+                    self.save_config()
+                    break
+
+    def start_download(self, url, platform, row_id):
+        # Change button to "Running" or disable it
+        btn = self.table.cellWidget(row_id, 5)
+        if isinstance(btn, QPushButton):
+            btn.setText("Running...")
+            btn.setEnabled(False)
+
+        # Get Folder
+        folder_item = self.table.item(row_id, 2)
+        folder = folder_item.text() if folder_item else None
+        if not folder: folder = None
+
+        # Select function
+        if platform == "Instagram":
+            # Check login first (Blocking check needs to be handled carefully, 
+            # ideally in worker too, but for simplicity we rely on MasterDownloader caching)
+            if not self.downloader.get_ig_session():
+                 self.log(f"Login required for {url}", "ERROR")
+                 self.update_status(row_id, "Login Failed")
+                 return
+            func = self.downloader.download_instagram
+        elif platform == "TikTok":
+            func = self.downloader.download_tiktok
+        elif platform == "Facebook":
+            func = self.downloader.download_facebook
+        else:
+             self.log(f"Unsupported URL: {url}", "ERROR")
+             return
+
+        # Create Worker
+        worker = DownloadWorker(func, row_id, url, output_folder=folder)
         
-        folder = filedialog.askdirectory(title="Chọn thư mục lưu cho các link đã chọn")
+        # Connect Signals
+        worker.signals.progress.connect(self.handle_progress)
+        worker.signals.finished.connect(lambda: self.handle_finished(row_id))
+        worker.signals.error.connect(lambda err: self.handle_error(row_id, err))
+        
+        self.threadpool.start(worker)
+        self.log(f"Started download for row {row_id}: {platform}", "INFO")
+
+    def handle_progress(self, data):
+        row_id, percent_str, speed_str, msg = data
+        
+        # Internal log messages (row_id = -1 for global tools)
+        if row_id == -1:
+            # Optionally log to text area if needed, or just update status bar
+            self.status_bar.showMessage(msg)
+            # Log significant messages
+            if "Deleted" in msg or "Checking" in msg:
+                 # Reduce spam in main log, only show if specific
+                 pass
+            return
+
+        # Validate row (simple check)
+        if row_id >= self.table.rowCount():
+            return
+            
+        # Get Progress Widgets
+        widget = self.table.cellWidget(row_id, 3)
+        if widget:
+            p_bar = widget.findChild(QProgressBar)
+            p_label = widget.findChild(QLabel)
+            
+            # Parse Percent
+            try:
+                # Remove '%' and convert to float
+                clean_pct = percent_str.replace('%', '').strip()
+                val = float(clean_pct)
+                p_bar.setValue(int(val))
+            except:
+                pass # Indeterminate or text
+                
+            # Update Label
+            p_label.setText(f"{percent_str} - {msg}")
+            
+        # Update Status Column
+        self.table.setItem(row_id, 4, QTableWidgetItem("Downloading"))
+
+    def handle_finished(self, row_id):
+        self.update_status(row_id, "Completed")
+        self.log(f"Download Finished (Row {row_id})", "SUCCESS")
+        
+        # Set Progress to 100% Green
+        widget = self.table.cellWidget(row_id, 3)
+        if widget:
+            p_bar = widget.findChild(QProgressBar)
+            p_bar.setValue(100)
+            p_bar.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }")
+            widget.findChild(QLabel).setText("Done")
+
+    def handle_error(self, row_id, err_info):
+        exctype, value, traceback_str = err_info
+        self.update_status(row_id, "Error")
+        self.log(f"Error on row {row_id}: {value}", "ERROR")
+        print(traceback_str)
+        
+        widget = self.table.cellWidget(row_id, 3)
+        if widget:
+             p_bar = widget.findChild(QProgressBar)
+             if p_bar:
+                 p_bar.setStyleSheet("QProgressBar::chunk { background-color: #ff5555; }")
+
+    def scan_duplicates_ui(self):
+        # Ask user for folder
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Clean Duplicates", self.base_dir)
         if not folder:
             return
 
-        for s in selection:
-            idx = self.tree.index(s)
-            self.config["saved_links"][idx]["folder"] = folder
+        confirm = QMessageBox.question(self, "Confirm Delete", 
+                                     f"Are you sure you want to scan and DELETE duplicate images in:\n{folder}\n\nThis cannot be undone!",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
-        self.refresh_list()
-        self.save_config()
-
-    def clear_all(self):
-        if messagebox.askyesno("Xác nhận", "Bạn có chắc muốn xóa HẾT danh sách link?"):
-            self.config["saved_links"] = []
-            self.refresh_list()
-            self.save_config()
-
-    def open_global_folder(self):
-        path = self.config.get("download_folder") or self.downloader.base_dir
-        os.startfile(path)
-
-        
-        # Stop button status is inverse of download buttons
-        stop_state = "normal" if state == "disabled" else "disabled"
-        self.btn_stop.config(state=stop_state)
-
-    def stop_download(self):
-        if self.is_downloading:
-             if messagebox.askyesno("Xác nhận", "Bạn có muốn dừng các tác vụ đang chờ không? (Tác vụ hiện tại sẽ chạy nốt)"):
-                 self.stop_event.set()
-                 print("\n⚠️ ĐANG DỪNG... Vui lòng đợi tác vụ hiện tại hoàn tất.")
-                 # Disable stop button to prevent multiple clicks
-                 self.btn_stop.config(state="disabled")
-    def set_buttons_state(self, state):
-        self.btn_download_all.config(state=state)
-        self.btn_download_selected.config(state=state)
-        if hasattr(self, 'btn_scan_dupes'):
-            self.btn_scan_dupes.config(state=state)
-        
-        # Update stop button state logic
-        stop_state = "normal" if state == "disabled" else "disabled"
-        self.btn_stop.config(state=stop_state)
-
-    def start_download_all(self):
-        links = self.config["saved_links"]
-        if not links:
-            messagebox.showwarning("Warning", "Danh sách trống!")
-            return
-        self.run_download_thread(links)
-
-    def start_download_selected(self):
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showwarning("Warning", "Chưa chọn link nào!")
-            return
-        
-        links = []
-        for s in selection:
-            idx = self.tree.index(s)
-            links.append(self.config["saved_links"][idx])
+        if confirm == QMessageBox.StandardButton.Yes:
+            self.log(f"Starting duplicate scan in: {folder}", "INFO")
             
-        self.run_download_thread(links)
-
-    def run_download_thread(self, links):
-        if self.is_downloading:
-            return
-        
-        self.is_downloading = True
-        self.set_buttons_state("disabled")
-        
-        threading.Thread(target=self.process_downloads, args=(links,), daemon=True).start()
-
-    def process_downloads(self, items):
-        # items is a list of dict: {"url": "...", "folder": "..."}
-        print(f"\n{'='*30}")
-        print(f"🚀 BẮT ĐẦU TẢI {len(items)} LINKS...")
-        print(f"{'='*30}\n")
-        
-        self.stop_event.clear()
-        
-        for i, item in enumerate(items):
-            if self.stop_event.is_set():
-                print(f"\n🛑 Đã dừng theo yêu cầu người dùng.")
-                break
-
-            link = item["url"]
-            custom_folder = item["folder"] if item["folder"] else None
+            worker = DuplicateWorker(self.downloader, folder)
+            worker.signals.progress.connect(self.handle_progress) # Reuse existing
+            worker.signals.result.connect(self.handle_scan_result)
+            worker.signals.error.connect(lambda err: self.log(f"Scan Error: {err[1]}", "ERROR"))
             
-            print(f"\n🔹 [{i+1}/{len(items)}] Xử lý: {link}")
-            if custom_folder:
-                print(f"   📂 Lưu tại: {custom_folder}")
+            self.threadpool.start(worker)
 
-            try:
-                if "tiktok.com" in link:
-                    self.downloader.download_tiktok(link, output_folder=custom_folder)
-                elif "facebook.com" in link:
-                    self.downloader.download_facebook(link, output_folder=custom_folder)
-                elif "instagram.com" in link:
-                    # Check login
-                    if not self.downloader.ig_logged_in:
-                         if not self.downloader.get_ig_session():
-                             print("❌ Cần đăng nhập Instagram trước!")
-                             pass
-                    
-                    if self.downloader.ig_logged_in:
-                        self.downloader.download_instagram(link, output_folder=custom_folder)
-                else:
-                    print("❓ Link không hỗ trợ.")
-            except Exception as e:
-                print(f"❌ Lỗi xử lý link: {e}")
-        
-        print(f"\n✅ HOÀN TẤT TẤT CẢ TÁC VỤ!")
-        self.is_downloading = False
-        # Update UI in main thread
-        self.after(0, lambda: self.set_buttons_state("normal"))
-
-    def scan_duplicates_thread(self):
-        if self.is_downloading:
-            messagebox.showwarning("Đang bận", "Vui lòng đợi tác vụ hiện tại hoàn tất.")
-            return
-
-        # 1. Thu thập danh sách thư mục tiềm năng
-        candidates = set()
-        
-        # Thư mục gốc (từ cấu hình hoặc từ downloader)
-        default_dir = self.config.get("download_folder", "") or self.downloader.base_dir
-        if default_dir and os.path.exists(default_dir):
-            candidates.add(os.path.abspath(default_dir))
-            
-        # Thư mục từ danh sách các link đã lưu
-        # Duyệt qua các item trong User TreeView
-        for item_id in self.tree.get_children():
-            row_data = self.tree.item(item_id)["values"]
-            # row_data = (url, folder)
-            if len(row_data) >= 2:
-                folder_path = row_data[1]
-                if folder_path and os.path.exists(folder_path):
-                    candidates.add(os.path.abspath(folder_path))
-        
-        # Sắp xếp danh sách
-        sorted_folders = sorted(list(candidates))
-        
-        # 2. Hiển thị Dialog chọn
-        if not sorted_folders:
-            # Nếu không có folder nào trong list, fallback về browse thường
-            target_dir = filedialog.askdirectory(title="Chọn Thư Mục Để Quét Ảnh Trùng", initialdir=default_dir)
+    def handle_scan_result(self, duplicates):
+        count = len(duplicates)
+        if count > 0:
+             self.log(f"Scan Complete. Removed {count} duplicate images.", "SUCCESS")
+             QMessageBox.information(self, "Scan Complete", f"Removed {count} duplicate images.")
         else:
-            # Dùng Custom Dialog
-            dlg = FolderSelectionDialog(self, sorted_folders)
-            self.wait_window(dlg)
-            target_dir = dlg.result
-            
-        if not target_dir:
-            return  # User cancelled
+             self.log("Scan Complete. No duplicates found.", "SUCCESS")
+             QMessageBox.information(self, "Scan Complete", "No duplicates found.")
 
-        if messagebox.askyesno("Xác nhận quét trùng lặp", 
-                               f"Bạn sắp quét thư mục:\n📂 {target_dir}\n\n"
-                               "Tính năng này sẽ tìm và XOÁ các ảnh có nội dung giống nhau.\n"
-                               "- Ảnh đầu tiên tìm thấy sẽ được giữ lại.\n"
-                               "- Các ảnh trùng lặp sau đó sẽ bị xoá vĩnh viễn.\n\n"
-                               "Bạn có CHẮC CHẮN muốn tiếp tục không?"):
-            self.set_buttons_state("disabled")
-            self.is_downloading = True 
-            threading.Thread(target=self.run_scan_duplicates, args=(target_dir,), daemon=True).start()
-
-    def run_scan_duplicates(self, target_dir):
-        print(f"\n{'-'*30}")
-        print(f"🧹 BẮT ĐẦU QUÉT ẢNH TRÙNG LẶP")
-        print(f"📂 Thư mục đích: {target_dir}")
-        print(f"{'-'*30}")
-        
-        self.stop_event.clear()
-        count = 0
-        error_msg = None
-
-        try:
-            # Gọi hàm scan từ MasterDownloader
-            results = self.downloader.scan_for_duplicates(directory=target_dir, remove=True)
-            count = len(results)
-            
-        except Exception as e:
-            print(f"❌ Lỗi khi quét: {e}")
-            error_msg = str(e)
-        finally:
-            print(f"\n✅ QUÉT HOÀN TẤT.")
-            self.is_downloading = False
-            
-            def show_result():
-                self.set_buttons_state("normal")
-                if error_msg:
-                    messagebox.showerror("Lỗi", f"Có lỗi xảy ra khi quét:\n{error_msg}")
-                else:
-                    if count > 0:
-                        messagebox.showinfo("Thành công", f"Đã quét xong!\n🗑️ Đã xoá {count} ảnh trùng lặp.")
-                    else:
-                        messagebox.showinfo("Thành công", "Đã quét xong!\n✨ Không tìm thấy ảnh trùng nào.")
-
-            self.after(0, show_result)
+    def update_status(self, row_id, text):
+        if row_id < self.table.rowCount():
+            self.table.setItem(row_id, 4, QTableWidgetItem(text))
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    
+    # Check dependencies
+    try:
+        import yt_dlp
+    except ImportError:
+        QMessageBox.critical(None, "Missing Dependency", "yt_dlp is missing.")
+        sys.exit(1)
+        
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
