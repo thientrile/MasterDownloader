@@ -1,0 +1,7 @@
+yt-dlp
+instaloader
+browser-cookie3
+colorama
+pyinstaller
+Pillow
+imagehash
