@@ -6,6 +6,7 @@ import random
 import itertools
 import json
 import errno
+import threading
 from urllib.parse import unquote
 import yt_dlp
 import instaloader
@@ -16,7 +17,7 @@ from cryptography.fernet import Fernet
 from colorama import init, Fore, Style
 
 # --- FIX LỖI HIỂN THỊ TIẾNG VIỆT TRÊN WINDOWS ---
-if sys.stdout.encoding != 'utf-8':
+if sys.stdout and sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 # -----------------------------------------------
 
@@ -66,9 +67,42 @@ class MasterDownloader:
         self.ig_sleep_range = (8, 15)
         self.ig_retry_on_401 = 3
         self.ig_max_posts = 30  # Gioi han so bai tai moi lan de giam risk (None de khong gioi han)
+        self.ig_lock = threading.Lock()
         self.history = self.load_history()
         self.migrate_archives()
         self.migrate_security()
+
+    def _create_isolated_ig_client(self):
+        """Create a fresh Instaloader instance so parallel jobs do not share dirname_pattern."""
+        client = instaloader.Instaloader(
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            user_agent=self.ig.context.user_agent,
+        )
+
+        # Reuse headers/cookies when possible
+        try:
+            client.context._session.headers.update(self.ig.context._session.headers)
+        except Exception:
+            pass
+
+        try:
+            client.context._session.cookies.update(self.ig.context._session.cookies)
+        except Exception:
+            pass
+
+        # Load session file if we have a logged-in user (keeps Stories/Highlights working)
+        if self.ig_username:
+            session_path = self.session_file_path(self.ig_username)
+            if os.path.exists(session_path):
+                try:
+                    client.load_session_from_file(self.ig_username, filename=session_path)
+                except Exception as e:
+                    print(f"{Fore.YELLOW}⚠️  Khong tai duoc session cho IG client moi: {e}")
+
+        return client
 
     def migrate_security(self):
         """Auto-encrypt plain text credentials on startup."""
@@ -685,8 +719,14 @@ class MasterDownloader:
 
     def download_instagram(self, url, output_folder=None, progress_callback=None):
         """Xử lý tải Instagram Profile/Post"""
-        url = url.split('?')[0].strip('/')
-        target = url.split('/')[-1]
+        # --- BẢO VỆ RATE LIMIT: CHỈ CHẠY TUẦN TỰ ---
+        if self.ig_lock.locked():
+            print(f"{Fore.YELLOW}⏳ Một tiến trình Instagram khác đang chạy. Đang đợi lượt... {url}")
+            if progress_callback: progress_callback("Wait", "Đang đợi tiến trình IG khác...")
+
+        with self.ig_lock:
+            url = url.split('?')[0].strip('/')
+            target = url.split('/')[-1]
         
         if "/p/" in url or "/reels/" in url or "/reel/" in url:
             try:
@@ -699,10 +739,12 @@ class MasterDownloader:
         print(f"{Fore.MAGENTA}📸 Dang quet Instagram cua: {target}")
         
         try:
+            ig_client = self._create_isolated_ig_client()
+            ig_logged_in = ig_client.context.is_logged_in or self.ig_logged_in
             profile = None
             for attempt, delay in enumerate(self.ig_profile_backoff, start=1):
                 try:
-                    profile = instaloader.Profile.from_username(self.ig.context, target)
+                    profile = instaloader.Profile.from_username(ig_client.context, target)
                     break
                 except Exception:
                     if attempt == len(self.ig_profile_backoff):
@@ -717,12 +759,12 @@ class MasterDownloader:
 
             # Thiet lap thu muc luu cho IG (dung chung theo username, uu tien history)
             if output_folder:
-                 resolved_folder = output_folder
+                resolved_folder = output_folder
             else:
-                 default_folder = os.path.join(self.base_dir, target)
-                 resolved_folder = self.resolve_folder("instagram", target, default_folder)
+                default_folder = os.path.join(self.base_dir, target)
+                resolved_folder = self.resolve_folder("instagram", target, default_folder)
             os.makedirs(resolved_folder, exist_ok=True)
-            self.ig.dirname_pattern = resolved_folder
+            ig_client.dirname_pattern = resolved_folder
 
             # --- LOAD HISTORY (Added Feature) ---
             # Ensure archive dir exists
@@ -751,8 +793,8 @@ class MasterDownloader:
             if progress_callback: progress_callback("Wait", "Đang quét Stories...")
             try:
                 # Lay stories cua user hien tai (can login)
-                if self.ig_logged_in:
-                    stories = self.ig.get_stories(userids=[profile.userid])
+                if ig_logged_in:
+                    stories = ig_client.get_stories(userids=[profile.userid])
                     has_story = False
                     for story in stories:
                         for item in story.get_items():
@@ -764,7 +806,7 @@ class MasterDownloader:
                                 continue
 
                             # download_storyitem tra ve True neu tai moi
-                            downloaded = self.ig.download_storyitem(item, target=target)
+                            downloaded = ig_client.download_storyitem(item, target=target)
                             
                             # Luu vao history
                             if downloaded:
@@ -796,14 +838,14 @@ class MasterDownloader:
             # --- TẢI HIGHLIGHTS (Added Feature) ---
             print(f"{Fore.MAGENTA}🌟 Dang quet & tai Highlights...")
             try:
-                if self.ig_logged_in:
-                    highlights = self.ig.get_highlights(user=profile)
+                if ig_logged_in:
+                    highlights = ig_client.get_highlights(user=profile)
                     has_highlight = False
                     for highlight in highlights:
                         print(f"{Fore.CYAN}   > Dang quet Highlight: {highlight.title}")
                         for item in highlight.get_items():
                             has_highlight = True
-                            if self.ig.download_storyitem(item, target=target):
+                            if ig_client.download_storyitem(item, target=target):
                                 print(f"{Fore.GREEN}     + Da tai item trong highlight '{highlight.title}': {item.date_local}")
                                 time.sleep(random.uniform(2, 5))
                     
@@ -844,7 +886,7 @@ class MasterDownloader:
                         
                         try:
                             # download_post trả về True nếu tải mới, False nếu bài đã tồn tại
-                            downloaded = self.ig.download_post(post, target=target)
+                            downloaded = ig_client.download_post(post, target=target)
                             
                             # Luu vao history NGAY LAP TUC (append mode)
                             try:
@@ -878,9 +920,14 @@ class MasterDownloader:
                     msg = str(e)
                     is_cnt_error = "Connection" in msg or "401" in msg or "Unauthorized" in msg or "few minutes" in msg
                     
-                    if is_cnt_error and outer_retries > 1:
-                        wait_time = 300 + random.uniform(30, 90) # Doi 5-6 phut
-                        print(f"{Fore.YELLOW}⚠️  IG chan request (401/Network). Doi {wait_time:.0f}s roi quet lai tu dau...")
+                    if (is_cnt_error or "429" in msg) and outer_retries > 1:
+                        if "429" in msg:
+                            wait_time = 1800 + random.uniform(60, 180) # Force 30 min wait if 429
+                            print(f"{Fore.RED}🛑 IG báo lỗi 429 (Too Many Requests). Phải đợi {wait_time/60:.1f} phút...")
+                        else:
+                            wait_time = 300 + random.uniform(30, 90) # Doi 5-6 phut
+                            print(f"{Fore.YELLOW}⚠️  IG chan request (401/Network). Doi {wait_time:.0f}s roi quet lai tu dau...")
+                        
                         time.sleep(wait_time)
                         outer_retries -= 1
                         print(f"{Fore.CYAN}🔄 Dang thu lai (lan {6 - outer_retries}/5)...")
