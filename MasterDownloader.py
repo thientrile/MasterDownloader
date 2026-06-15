@@ -7,7 +7,11 @@ import itertools
 import json
 import errno
 import threading
-from urllib.parse import unquote
+import subprocess
+import shutil
+import hashlib
+from urllib.parse import unquote, urlparse
+import requests
 import yt_dlp
 import instaloader
 import browser_cookie3
@@ -48,7 +52,13 @@ class MasterDownloader:
             download_comments=False,
             save_metadata=False,
             compress_json=False,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            max_connection_attempts=3,
+            request_timeout=300.0,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
+            )
         )
         
         # Crypto setup
@@ -64,13 +74,42 @@ class MasterDownloader:
         self.ig_profile_backoff = [180, 300, 600]
         self.ig_wait_401_base = 420
         self.ig_wait_401_jitter = (45, 120)
-        self.ig_sleep_range = (8, 15)
+        self.ig_sleep_range = (20, 45)
         self.ig_retry_on_401 = 3
-        self.ig_max_posts = 30  # Gioi han so bai tai moi lan de giam risk (None de khong gioi han)
+        self.ig_max_posts = 20  # Gioi han so bai tai moi lan de giam risk (None de khong gioi han)
+        self.ig_download_stories = False
+        self.ig_download_highlights = False
+        self.ig_cooldown_until = 0
+        self.ig_block_cooldown = 6 * 60 * 60
         self.ig_lock = threading.Lock()
         self.history = self.load_history()
         self.migrate_archives()
         self.migrate_security()
+
+    def _is_ig_block_error(self, error):
+        msg = str(error).lower()
+        return any(token in msg for token in [
+            "401",
+            "403",
+            "forbidden",
+            "unauthorized",
+            "too many requests",
+            "please wait a few minutes",
+            "few minutes",
+            "429",
+        ])
+
+    def _is_ig_invalid_request_error(self, error):
+        msg = str(error).lower()
+        return "400 bad request" in msg or '"invalid request"' in msg or "invalid request" in msg
+
+    def _start_ig_cooldown(self, reason):
+        self.ig_cooldown_until = time.time() + self.ig_block_cooldown
+        wait_hours = self.ig_block_cooldown / 3600
+        print(f"{Fore.RED}🛑 IG dang bi chan/rate-limit ({reason}). Tam dung IG khoang {wait_hours:.0f} gio de tranh bi khoa nang hon.")
+
+    def _ig_cooldown_remaining(self):
+        return max(0, int(self.ig_cooldown_until - time.time()))
 
     def _create_isolated_ig_client(self):
         """Create a fresh Instaloader instance so parallel jobs do not share dirname_pattern."""
@@ -79,6 +118,8 @@ class MasterDownloader:
             download_comments=False,
             save_metadata=False,
             compress_json=False,
+            max_connection_attempts=3,
+            request_timeout=300.0,
             user_agent=self.ig.context.user_agent,
         )
 
@@ -90,6 +131,11 @@ class MasterDownloader:
 
         try:
             client.context._session.cookies.update(self.ig.context._session.cookies)
+        except Exception:
+            pass
+
+        try:
+            self._apply_instagram_browser_session(client.context._session)
         except Exception:
             pass
 
@@ -271,9 +317,248 @@ class MasterDownloader:
         """Helper to read and clean manual cookie string. DEPRECATED."""
         return self.get_manual_cookie("instagram") or self.get_manual_cookie("tiktok")
 
+    def _sanitize_name(self, value, fallback):
+        value = (value or "").strip().strip("@")
+        safe = "".join(c for c in value if c.isalnum() or c in ('-', '_', '.', ' ')).strip()
+        return safe or fallback
+
+    def _archive_path(self, folder, platform, username, kind="ydl"):
+        safe_platform = self._sanitize_name(platform, "site").lower()
+        safe_name = self._sanitize_name(username, safe_platform)
+        safe_kind = self._sanitize_name(kind, "history").lower()
+        return os.path.join(folder, f".masterdownloader_{safe_platform}_{safe_kind}_{safe_name}.txt")
+
+    def _merge_archive_once(self, old_path, new_path):
+        if not old_path or not new_path or old_path == new_path or not os.path.exists(old_path):
+            return
+        try:
+            old_lines = []
+            with open(old_path, "r", encoding="utf-8", errors="ignore") as src:
+                old_lines = [line for line in src if line.strip()]
+            if not old_lines:
+                return
+            existing = set()
+            if os.path.exists(new_path):
+                with open(new_path, "r", encoding="utf-8", errors="ignore") as dst_read:
+                    existing = {line.strip() for line in dst_read if line.strip()}
+            with open(new_path, "a", encoding="utf-8") as dst:
+                for line in old_lines:
+                    stripped = line.strip()
+                    if stripped and stripped not in existing:
+                        dst.write(stripped + "\n")
+                        existing.add(stripped)
+        except Exception as e:
+            print(f"{Fore.YELLOW}⚠️  Khong merge duoc history cu {old_path!r}: {e}")
+
+    def _instagram_url_kind(self, url):
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        parts = [p for p in parsed.path.split("/") if p]
+        if not parts:
+            return "home"
+        first = parts[0].lower()
+        if first == "stories" and len(parts) > 1 and parts[1].lower() == "highlights":
+            return "highlight"
+        if first in {"p", "reel", "reels", "tv"}:
+            return "post"
+        if first == "stories":
+            return "story"
+        if first in {"explore", "accounts", "direct"}:
+            return "other"
+        return "profile"
+
+    def _has_usable_instagram_cookie(self):
+        cookies = self._parse_cookie_string(self.get_manual_cookie("instagram") or "")
+        return bool(cookies.get("sessionid") and cookies.get("ds_user_id"))
+
+    def _edge_cookie_db_exists(self):
+        candidates = [
+            os.path.expanduser("~/.config/microsoft-edge/Default/Cookies"),
+            os.path.expanduser("~/.config/microsoft-edge/Default/Network/Cookies"),
+            os.path.expanduser("~/.config/microsoft-edge-dev/Default/Cookies"),
+            os.path.expanduser("~/.config/microsoft-edge-dev/Default/Network/Cookies"),
+        ]
+        return any(os.path.exists(path) for path in candidates)
+
+    def _instagram_web_profile_info(self, username):
+        cookie = self.get_manual_cookie("instagram")
+        if not cookie:
+            return None, "no_cookie"
+        headers = self._instagram_browser_headers(cookie, referer=f"https://www.instagram.com/{username}/")
+        headers["Cookie"] = cookie
+        try:
+            response = requests.get(
+                "https://www.instagram.com/api/v1/users/web_profile_info/",
+                params={"username": username},
+                headers=headers,
+                timeout=25,
+            )
+            if response.status_code in (401, 403, 429):
+                return None, f"http_{response.status_code}"
+            if response.status_code == 404:
+                return None, "not_found"
+            response.raise_for_status()
+            data = response.json()
+            return data.get("data", {}).get("user"), None
+        except Exception as e:
+            return None, str(e)
+
+    def _extract_tiktok_account_from_url(self, url):
+        match = re.search(r'(?:tiktok\.com|douyin\.com)/@([^/?#]+)', url, re.IGNORECASE)
+        return self._sanitize_name(match.group(1), "tiktok") if match else None
+
+    def _extract_facebook_account_from_url(self, url):
+        match = re.search(r"facebook\.com/([^/?#]+)", url, re.IGNORECASE)
+        if not match:
+            return None
+        account = match.group(1)
+        if account.lower() in {"watch", "reel", "videos", "share", "story.php", "photo.php"}:
+            return None
+        return self._sanitize_name(account, "facebook")
+
+    def _normalize_tiktok_url(self, url):
+        """Keep TikTok URLs intact, with a best-effort fallback for story links."""
+        url = url.strip()
+        if "/photo/" in url:
+            return [url.replace("/photo/", "/video/"), url]
+
+        story_match = re.search(
+            r'(https?://(?:www\.)?tiktok\.com/@[^/?#]+)/(?:story|stories)/(\d+)',
+            url,
+            re.IGNORECASE,
+        )
+        if story_match:
+            video_url = f"{story_match.group(1)}/video/{story_match.group(2)}"
+            return [url, video_url]
+
+        return [url]
+
+    def _tiktok_url_kind(self, url):
+        path = urlparse(url if "://" in url else f"https://{url}").path.lower()
+        if "/story/" in path or "/stories/" in path:
+            return "story"
+        if "/photo/" in path:
+            return "photo"
+        return "video"
+
+    def _extract_ydl_account(self, url, fallback):
+        """Ask yt-dlp for metadata when the account is not present in the URL."""
+        try:
+            opts = self._rate_limit_ydl_opts()
+            opts.update({
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'extract_flat': False,
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if not info:
+                return fallback
+
+            candidates = [
+                info.get('uploader_id'),
+                info.get('uploader'),
+                info.get('channel_id'),
+                info.get('channel'),
+                info.get('creator'),
+                info.get('artist'),
+            ]
+            for candidate in candidates:
+                safe = self._sanitize_name(candidate, "")
+                if safe:
+                    return safe
+        except Exception as e:
+            print(f"{Fore.YELLOW}⚠️  Khong lay duoc ten tai khoan tu metadata: {e}")
+        return fallback
+
+    def _parse_cookie_string(self, cookie_string):
+        cookies = {}
+        if not cookie_string:
+            return cookies
+        for pair in cookie_string.split(';'):
+            if '=' not in pair:
+                continue
+            name, val = pair.split('=', 1)
+            name = name.strip()
+            val = val.strip().strip('"')
+            if name:
+                cookies[name] = val
+        return cookies
+
+    def _instagram_browser_headers(self, cookie_string=None, referer="https://www.instagram.com/"):
+        cookies = self._parse_cookie_string(cookie_string or self.get_manual_cookie("instagram") or "")
+        csrf_token = cookies.get("csrftoken")
+        claim = cookies.get("ig_www_claim")
+        headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'vi,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Pragma': 'no-cache',
+            'Referer': referer,
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Sec-Ch-Prefers-Color-Scheme': 'dark',
+            'Sec-Ch-Ua': '"Microsoft Edge";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0'
+            ),
+            'X-ASBD-ID': '359341',
+            'X-IG-App-ID': '936619743392459',
+            'X-IG-Max-Touch-Points': '0',
+        }
+        if csrf_token:
+            headers['X-CSRFToken'] = csrf_token
+        if claim:
+            headers['X-IG-WWW-Claim'] = claim
+        return headers
+
+    def _apply_instagram_browser_session(self, session, cookie_string=None, referer="https://www.instagram.com/"):
+        """Apply browser-like headers/cookies to Instaloader's underlying requests session."""
+        cookie_string = cookie_string or self.get_manual_cookie("instagram") or ""
+        session.headers.update(self._instagram_browser_headers(cookie_string, referer=referer))
+        session.headers.setdefault("DNT", "1")
+        for name, val in self._parse_cookie_string(cookie_string).items():
+            session.cookies.set(name, val, domain=".instagram.com", path="/")
+            session.cookies.set(name, val, domain="www.instagram.com", path="/")
+
+    def _rate_limit_ydl_opts(self):
+        """Shared yt-dlp options that slow requests down and retry transient blocks."""
+        return {
+            'retries': 10,
+            'fragment_retries': 10,
+            'extractor_retries': 5,
+            'sleep_interval': 10,
+            'max_sleep_interval': 30,
+            'sleep_interval_requests': 5,
+            'sleep_interval_subtitles': 5,
+            'throttledratelimit': 100 * 1024,
+            'http_headers': {
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/121.0.0.0 Safari/537.36'
+                ),
+            },
+        }
+
     def _prepare_yt_dlp(self, ydl_opts, label):
         """Build a YoutubeDL instance with resilient archive handling."""
-        opts = dict(ydl_opts)
+        opts = self._rate_limit_ydl_opts()
+        opts.update(ydl_opts)
+
+        # Tro yt-dlp den ffmpeg (uu tien PATH, fallback imageio-ffmpeg) de merge format/convert
+        if not opts.get('ffmpeg_location'):
+            ffmpeg = self._get_ffmpeg_exe()
+            if ffmpeg:
+                opts['ffmpeg_location'] = ffmpeg
+
         archive_path = opts.get('download_archive')
 
         if archive_path and not self._touch_archive_file(archive_path):
@@ -317,7 +602,7 @@ class MasterDownloader:
         # Chuan hoa: neu folder cu dang TikTok_username hoac IG_username thi doi ve username thuan
         basename = os.path.basename(folder)
         if (basename.startswith("TikTok_") or basename.startswith("IG_")) and basename.endswith(username):
-            folder = os.path.join(self.root_dir, username)
+            folder = os.path.join(self.base_dir, username)
 
         # Luu lai mapping moi
         self.history[key] = {"folder": folder}
@@ -410,58 +695,29 @@ class MasterDownloader:
             # Reset cookie jar de dam bao sach se
             self.ig.context._session.cookies.clear()
             
-            user_id_val = None
-            csrf_token_val = None
+            parsed_cookies = self._parse_cookie_string(cookie_data)
+            user_id_val = parsed_cookies.get('ds_user_id')
 
-            # --- PARSE COOKIES INTO JAR (SUA LOI: KHONG DUNG HEADER TRUC TIEP) ---
-            # Parse chuoicookie vao cookie jar de requests tu dong quan ly (cap nhat csrf, version...)
-            # Format: name=value; name2=value2
-            pairs = cookie_data.split(';')
-            for pair in pairs:
-                if '=' not in pair:
-                    continue
-                name, val = pair.split('=', 1)
-                name = name.strip()
-                val = val.strip().strip('"')
-                
-                # Add to jar for .instagram.com
-                self.ig.context._session.cookies.set(name, val, domain='.instagram.com', path='/')
-
-                if name == 'ds_user_id':
-                    user_id_val = val
-                
-                if name == 'csrftoken':
-                    csrf_token_val = val
-
-            # Update headers (Delete manual 'Cookie' header if it exists from previous runs/edits to be safe, 
-            # though we are just initializing here)
+            # Update headers/cookies like a normal browser session.
             if 'Cookie' in self.ig.context._session.headers:
                 del self.ig.context._session.headers['Cookie']
+            self._apply_instagram_browser_session(self.ig.context._session, cookie_data)
 
-            # Cap nhat headers day du nhu Chrome that de tranh bi chan
-            headers = {
-                'Referer': 'https://www.instagram.com/',
-                'Origin': 'https://www.instagram.com',
-                'X-Requested-With': 'XMLHttpRequest',
-                'X-IG-App-ID': '936619743392459', 
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin',
-                'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-                'Sec-Ch-Ua-Mobile': '?0',
-                'Sec-Ch-Ua-Platform': '"Windows"',
-                'Connection': 'keep-alive',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Upgrade-Insecure-Requests': '1',
-            }
-            if csrf_token_val:
-                headers['X-CSRFToken'] = csrf_token_val
-            
-            self.ig.context._session.headers.update(headers)
+            # Prefer the real logged-in username when Instagram accepts the cookie.
+            try:
+                username = self.ig.test_login()
+                if username:
+                    self.ig_username = username
+                    self.ig.context.username = username
+                    self.ig.context._is_logged_in = True
+                    self.ig_logged_in = True
+                    self.ig.save_session_to_file(filename=self.session_file_path(username))
+                    print(f"{Fore.GREEN}✅ Da nap cookie IG va luu session theo username: {username}")
+                    return True
+            except Exception as e:
+                print(f"{Fore.YELLOW}⚠️  test_login voi cookie IG chua thanh cong, fallback sang ds_user_id: {e}")
 
-            # BYPASS: Khong can test_login neu da co ds_user_id
+            # BYPASS: Neu test_login khong duoc nhung cookie co ds_user_id thi van thu tiep
             if user_id_val:
                 self.ig_username = user_id_val
                 # QUAN TRONG: Set username cho context de instaloader biet dang la ai
@@ -508,6 +764,7 @@ class MasterDownloader:
             # Thu lay tu Edge
             cookies = browser_cookie3.edge(domain_name="instagram.com")
             self.ig.context._session.cookies.update(cookies)
+            self._apply_instagram_browser_session(self.ig.context._session)
             
             # Kiem tra xem cookie co hieu luc khong (da login chua)
             username = self.ig.test_login()
@@ -574,13 +831,36 @@ class MasterDownloader:
             print(f"{Fore.RED}❌ Loi dang nhap: {e}")
             return False
 
+    def _video_extensions(self):
+        return {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+
+    def _video_format(self):
+        """Tai video kem am thanh (merge bestvideo + bestaudio)."""
+        return 'bestvideo*+bestaudio/best'
+
+    def _get_ffmpeg_exe(self):
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            return ffmpeg_path
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return None
+
     def _handle_ydl_progress(self, d, progress_callback):
         """Helper to handle yt-dlp progress hooks via callback."""
         if d['status'] == 'downloading':
             percent = d.get('_percent_str', '').strip()
             speed = d.get('_speed_str', '').strip()
             eta = d.get('_eta_str', '').strip()
+            info = d.get('info_dict') or {}
+            fname = os.path.basename(d.get('filename') or info.get('_filename') or info.get('filepath') or '')
+            if len(fname) > 45:
+                fname = fname[:44] + '…'
             msg = f"{percent} | {speed} | ETA: {eta}"
+            if fname:
+                msg = f"{msg} | {fname}"
             print(f"{Fore.YELLOW}📥 {msg}", end='\r')
             if progress_callback:
                 progress_callback(percent, msg)
@@ -617,12 +897,14 @@ class MasterDownloader:
         # Giữ nguyên tham số URL vì Story có thể cần tham số để định danh chính xác
         # url = url.split('?')[0].strip() 
         url = url.strip()
-        
-        if "/photo/" in url:
-            url = url.replace("/photo/", "/video/")
+        if self._tiktok_url_kind(url) == "story":
+            return self.download_tiktok_story(url, output_folder=output_folder, progress_callback=progress_callback)
+
+        candidate_urls = self._normalize_tiktok_url(url)
             
-        match = re.search(r'@([^/?]+)', url)
-        username = match.group(1) if match else "Unknown"
+        username = self._extract_tiktok_account_from_url(url)
+        if not username:
+            username = self._extract_ydl_account(url, "tiktok")
         
         # Tao thu muc rieng cho user (uu tien lay tu history neu co)
         if output_folder:
@@ -632,10 +914,12 @@ class MasterDownloader:
              folder = self.resolve_folder("tiktok", username, default_folder)
         os.makedirs(folder, exist_ok=True)
             
-        archive = os.path.join(self.archive_dir, f"tiktok_{username}.txt")
+        safe_name = self._sanitize_name(username, "tiktok")
+        archive = self._archive_path(folder, "tiktok", safe_name, "ydl")
+        self._merge_archive_once(os.path.join(self.archive_dir, f"tiktok_{safe_name}.txt"), archive)
         
         ydl_opts_base = {
-            'format': 'bestvideo+bestaudio/best',
+            'format': self._video_format(),
             'outtmpl': os.path.join(folder, '%(upload_date)s - %(title|No Title).100s [%(id)s] - %(playlist_index)s.%(ext)s'),
             'download_archive': archive,
             'ignoreerrors': True,
@@ -689,7 +973,7 @@ class MasterDownloader:
                     print(f"{Fore.CYAN}ℹ️  Dang thu lay cookie tu Edge...")
                 
                 with self._prepare_yt_dlp(opts, f"TikTok {username}") as ydl:
-                    ydl.download([url])
+                    ydl.download(candidate_urls)
                 
                 # Neu chay OK ma khong loi thi thoat vong lap chien luoc
                 break 
@@ -712,13 +996,305 @@ class MasterDownloader:
                     if label == "Manual Cookie":
                          print(f"{Fore.YELLOW}👉 Cookie thu cong co ve da het han hoac bi chan.")
                     continue
+
+                if "/story" in url or "/stories" in url:
+                    print(f"{Fore.YELLOW}⚠️  Story TikTok co the chua duoc yt-dlp ho tro truc tiep. Hay thu copy link video/story tu nut Share va dam bao cookie TikTok con song.")
+                    continue
                 
                 # Cac loi khac thi raise luon
                 print(f"{Fore.RED}❌ Loi TikTok: {e}")
                 raise e
 
+    def download_tiktok_story(self, url, output_folder=None, progress_callback=None):
+        """TikTok story-only flow.
+
+        yt-dlp khong co extractor rieng cho Story, nen ta map link /story/{id}
+        sang /video/{id} (dang ma TikTokIE ho tro) va uu tien tai link video truoc
+        de tranh log "Unsupported URL" thua.
+        """
+        url = url.strip()
+        candidate_urls = self._normalize_tiktok_url(url)
+        # Uu tien dang /video/{id} (yt-dlp ho tro) len dau danh sach
+        candidate_urls = sorted(candidate_urls, key=lambda u: 0 if "/video/" in u else 1)
+
+        username = self._extract_tiktok_account_from_url(url) or "tiktok"
+        if output_folder:
+            folder = output_folder
+        else:
+            default_folder = os.path.join(self.base_dir, username)
+            folder = self.resolve_folder("tiktok", username, default_folder)
+        os.makedirs(folder, exist_ok=True)
+
+        safe_name = self._sanitize_name(username, "tiktok")
+        archive = self._archive_path(folder, "tiktok_story", safe_name, "ydl")
+        self._merge_archive_once(os.path.join(self.archive_dir, f"tiktok_story_{safe_name}.txt"), archive)
+
+        ydl_opts_base = {
+            'format': self._video_format(),
+            'outtmpl': os.path.join(folder, '%(upload_date)s - STORY - %(title|No Title).100s [%(id)s].%(ext)s'),
+            'download_archive': archive,
+            'ignoreerrors': True,
+            'writethumbnails': True,
+            'postprocessors': [{
+                'key': 'FFmpegThumbnailsConvertor',
+                'format': 'jpg',
+            }],
+            'quiet': False,
+            'no_warnings': True,
+            'force_ipv4': True,
+            'sleep_interval': 8,
+            'max_sleep_interval': 20,
+            'sleep_interval_requests': 3,
+            'progress_hooks': [
+                lambda d: self._handle_ydl_progress(d, progress_callback)
+            ],
+        }
+
+        print(f"{Fore.CYAN}🚀 Dang quet TikTok Story cua: {username}")
+        if progress_callback:
+            progress_callback("0%", "Đang lấy story TikTok...")
+
+        manual_cookie = self.get_manual_cookie("tiktok")
+        strategies = []
+        if manual_cookie:
+            temp_cookie_path = self._create_temp_cookie_file(manual_cookie)
+            if temp_cookie_path:
+                strategies.append(("Manual Cookie", {'cookiefile': temp_cookie_path}))
+        strategies.append(("Browser Cookies", {'cookiesfrombrowser': ('edge',)}))
+        strategies.append(("No Cookies", {}))
+
+        for label, extra_opts in strategies:
+            opts = ydl_opts_base.copy()
+            opts.update(extra_opts)
+            try:
+                if label == "Manual Cookie":
+                    print(f"{Fore.CYAN}🍪 Dang dung Manual Cookie tu settings...")
+                elif label == "Browser Cookies":
+                    print(f"{Fore.CYAN}ℹ️  Dang thu lay cookie tu Edge...")
+
+                with self._prepare_yt_dlp(opts, f"TikTok Story {username}") as ydl:
+                    ydl.download(candidate_urls)
+
+                print(f"{Fore.GREEN}✅ TikTok Story da tai xong.")
+                return
+            except Exception as e:
+                err_msg = str(e)
+                is_cookie_error = "Permission denied" in err_msg or "CookieLoadError" in err_msg or "Could not copy" in err_msg
+                if is_cookie_error:
+                    if label == "Browser Cookies":
+                        print(f"{Fore.YELLOW}⚠️  Khong doc duoc cookie Edge (do dang mo). Bo qua.")
+                    else:
+                        print(f"{Fore.RED}❌ Loi cookie: {e}")
+                    continue
+                if "429" in err_msg or "Too Many Requests" in err_msg:
+                    print(f"{Fore.RED}❌ Bi TikTok chan (429) o che do {label}.")
+                    continue
+                print(f"{Fore.YELLOW}⚠️  TikTok Story fail voi {label}: {e}")
+                continue
+
+        print(f"{Fore.RED}❌ Khong tai duoc TikTok Story.")
+
+    def download_instagram_with_ytdlp(self, url, target, output_folder=None, progress_callback=None):
+        """Try yt-dlp first for Instagram to avoid Instaloader GraphQL profile lookups."""
+        if output_folder:
+            folder = output_folder
+        else:
+            default_folder = os.path.join(self.base_dir, target or "instagram")
+            folder = self.resolve_folder("instagram", target or "instagram", default_folder)
+        os.makedirs(folder, exist_ok=True)
+
+        safe_name = self._sanitize_name(target or "instagram", "instagram")
+        archive = self._archive_path(folder, "instagram", safe_name, "ydl")
+        self._merge_archive_once(os.path.join(self.archive_dir, f"instagram_ytdlp_{safe_name}.txt"), archive)
+        manual_cookie = self.get_manual_cookie("instagram")
+        temp_cookie_path = self._create_temp_cookie_file(manual_cookie, domain=".instagram.com") if manual_cookie else None
+        url_kind = self._instagram_url_kind(url)
+
+        ydl_opts_base = {
+            'format': self._video_format(),
+            'outtmpl': os.path.join(folder, '%(uploader|instagram)s - %(upload_date>%Y-%m-%d|unknown)s - %(title|No Title).120s [%(id)s].%(ext)s'),
+            'download_archive': archive,
+            'ignoreerrors': True,
+            'writethumbnails': True,
+            'quiet': False,
+            'no_warnings': False,
+            'playlistend': self.ig_max_posts or 20,
+            'sleep_interval': 30,
+            'max_sleep_interval': 75,
+            'sleep_interval_requests': 12,
+            'extractor_retries': 1,
+            'retries': 3,
+            'fragment_retries': 3,
+            'http_headers': self._instagram_browser_headers(manual_cookie, referer=f"https://www.instagram.com/{target}/" if target else "https://www.instagram.com/"),
+            'progress_hooks': [
+                lambda d: self._handle_ydl_progress(d, progress_callback)
+            ],
+        }
+
+        strategies = []
+        if temp_cookie_path:
+            strategies.append(("Manual Cookie", {'cookiefile': temp_cookie_path}))
+        if self._edge_cookie_db_exists():
+            strategies.append(("Browser Cookies", {'cookiesfrombrowser': ('edge',)}))
+        elif not temp_cookie_path:
+            print(f"{Fore.YELLOW}⚠️  WSL khong thay cookie Edge Linux. Hay luu Instagram Cookie trong Settings de tai profile/private.")
+
+        if url_kind != "profile":
+            strategies.append(("No Cookies", {}))
+        elif not strategies:
+            print(f"{Fore.YELLOW}⚠️  Link Instagram profile can cookie dang nhap. Bo qua No Cookies vi IG se tra ve nhu profile khong ton tai.")
+            return False
+
+        for label, extra_opts in strategies:
+            opts = ydl_opts_base.copy()
+            opts.update(extra_opts)
+            try:
+                print(f"{Fore.CYAN}📸 IG yt-dlp engine: {label}")
+                if progress_callback:
+                    progress_callback("0%", f"Instagram yt-dlp: {label}")
+                with self._prepare_yt_dlp(opts, f"Instagram {target}") as ydl:
+                    code = ydl.download([url])
+                if code == 0:
+                    print(f"{Fore.GREEN}✅ IG yt-dlp engine hoan tat.")
+                    return True
+            except Exception as e:
+                if self._is_ig_block_error(e):
+                    print(f"{Fore.YELLOW}⚠️  IG yt-dlp bi chan voi {label}: {e}")
+                    continue
+                err_msg = str(e)
+                is_cookie_error = "Permission denied" in err_msg or "CookieLoadError" in err_msg or "Could not copy" in err_msg
+                if is_cookie_error:
+                    print(f"{Fore.YELLOW}⚠️  Khong doc duoc cookie IG voi {label}: {e}")
+                    continue
+                print(f"{Fore.YELLOW}⚠️  IG yt-dlp fail voi {label}: {e}")
+                continue
+
+        return False
+
+    def _write_gallerydl_cookie_file(self, cookie_string):
+        return self._create_temp_cookie_file(cookie_string, domain=".instagram.com")
+
+    def download_instagram_gallerydl(self, url, output_folder=None, progress_callback=None):
+        """Instagram v2 engine: use gallery-dl as the sole downloader."""
+        url = url.strip().split("?")[0].strip("/")
+        target = url.split("/")[-1] or "instagram"
+        url_kind = self._instagram_url_kind(url)
+
+        if output_folder:
+            folder = output_folder
+        else:
+            default_folder = os.path.join(self.base_dir, target)
+            folder = self.resolve_folder("instagram", target, default_folder)
+        os.makedirs(folder, exist_ok=True)
+
+        safe_target = self._sanitize_name(target, "instagram")
+        archive_path = os.path.join(folder, f".masterdownloader_instagram_gallerydl_{safe_target}.sqlite3")
+
+        manual_cookie = self.get_manual_cookie("instagram")
+        cookie_file = self._write_gallerydl_cookie_file(manual_cookie) if manual_cookie else None
+
+        include_modes = {
+            "profile": "posts,reels,tagged,stories,highlights",
+            "story": "stories",
+            "highlight": "highlights",
+            "post": "posts",
+        }.get(url_kind, "posts,reels,tagged,stories,highlights")
+        if not cookie_file:
+            print(f"{Fore.YELLOW}⚠️  Khong co Instagram Cookie. gallery-dl van se thu tai, nhung profile/private/stories co the bi han che.")
+
+        cmd = [
+            sys.executable, "-m", "gallery_dl",
+            "--config-ignore",
+            "--no-input",
+            "--no-colors",
+            "--directory", folder,
+            "--download-archive", archive_path,
+            "--sleep", f"{self.ig_sleep_range[0]}-{self.ig_sleep_range[1]}",
+            "--sleep-request", "8-20",
+            "--sleep-429", "300-900",
+            "--retries", "3",
+            "--http-timeout", "45",
+            "--user-agent", self.ig.context.user_agent,
+            "-o", "extractor.ytdl.module=yt_dlp",
+            "-o", "extractor.ytdl.forward-cookies=true",
+            "-o", "extractor.ytdl.raw-options.no_color=true",
+            "-o", "extractor.ytdl.raw-options.quiet=false",
+            "-o", "extractor.ytdl.format=bestvideo*+bestaudio/best",
+            "-o", f"extractor.instagram.include={include_modes}",
+        ]
+
+        if self.ig_max_posts and url_kind == "profile":
+            cmd.extend(["-o", f"extractor.instagram.max-posts={self.ig_max_posts}"])
+        if cookie_file:
+            cmd.extend(["--cookies", cookie_file])
+        cmd.append(url)
+
+        print(f"{Fore.CYAN}📸 IG v2 engine: gallery-dl")
+        print(f"{Fore.CYAN}📜 History File: {archive_path}")
+        if progress_callback:
+            progress_callback("0%", "Instagram v2 gallery-dl đang tải...")
+
+        process = subprocess.Popen(
+            cmd,
+            cwd=self.base_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        last_line = ""
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            last_line = line
+            print(line)
+            if progress_callback:
+                progress_callback("Running", line[-160:])
+
+        code = process.wait()
+
+        if code == 0:
+            msg = "Instagram v2 gallery-dl hoàn tất."
+            print(f"{Fore.GREEN}✅ {msg}")
+            if progress_callback:
+                progress_callback("100%", msg)
+            return
+
+        lowered = last_line.lower()
+        if "429" in lowered or "too many requests" in lowered:
+            self._start_ig_cooldown("gallery-dl 429")
+            if progress_callback:
+                progress_callback("Blocked", "Instagram 429 từ gallery-dl. Đã bật cooldown.")
+            return
+        if "login" in lowered or "cookies" in lowered or "private" in lowered or "forbidden" in lowered:
+            msg = "gallery-dl không đọc được IG bằng cookie hiện tại. Hãy copy lại Instagram Cookie từ tài khoản đang xem được profile."
+            print(f"{Fore.RED}❌ {msg}")
+            if progress_callback:
+                progress_callback("Need Cookie", msg)
+            return
+
+        msg = f"gallery-dl lỗi exit code {code}: {last_line}"
+        print(f"{Fore.RED}❌ {msg}")
+        if progress_callback:
+            progress_callback("Error", msg)
+
     def download_instagram(self, url, output_folder=None, progress_callback=None):
         """Xử lý tải Instagram Profile/Post"""
+        return self.download_instagram_gallerydl(url, output_folder=output_folder, progress_callback=progress_callback)
+
+        remaining = self._ig_cooldown_remaining()
+        if remaining > 0:
+            msg = f"Instagram đang cooldown do bị 401/403. Thử lại sau khoảng {remaining // 60} phút."
+            print(f"{Fore.YELLOW}⏳ {msg}")
+            if progress_callback:
+                progress_callback("Cooldown", msg)
+            return
+
         # --- BẢO VỆ RATE LIMIT: CHỈ CHẠY TUẦN TỰ ---
         if self.ig_lock.locked():
             print(f"{Fore.YELLOW}⏳ Một tiến trình Instagram khác đang chạy. Đang đợi lượt... {url}")
@@ -727,32 +1303,85 @@ class MasterDownloader:
         with self.ig_lock:
             url = url.split('?')[0].strip('/')
             target = url.split('/')[-1]
-        
-        if "/p/" in url or "/reels/" in url or "/reel/" in url:
-            try:
-                post = instaloader.Post.from_shortcode(self.ig.context, target)
-                target = post.owner_username
-            except Exception as e:
-                print(f"{Fore.RED}❌ Khong tim thay bai viet: {e}")
+            url_kind = self._instagram_url_kind(url)
+
+            if url_kind == "profile":
+                if not self._has_usable_instagram_cookie():
+                    msg = (
+                        "Profile Instagram can cookie dang nhap hop le, nhat la profile private/chi follower moi xem duoc. "
+                        "Hay vao Settings -> Instagram Cookie, dan full Cookie header tu trinh duyet dang login."
+                    )
+                    print(f"{Fore.RED}❌ {msg}")
+                    if progress_callback:
+                        progress_callback("Need Cookie", msg)
+                    return
+
+                profile_info, profile_error = self._instagram_web_profile_info(target)
+                if profile_error in {"http_401", "http_403", "http_429"}:
+                    print(f"{Fore.YELLOW}⚠️  IG web precheck bi {profile_error}; bo qua precheck va thu truc tiep bang Instaloader.")
+                    if progress_callback:
+                        progress_callback("Precheck Skip", "Bỏ qua precheck IG, thử trực tiếp bằng Instaloader.")
+                if profile_error == "not_found":
+                    msg = f"Instagram khong thay profile {target}. Kiem tra dung username/link."
+                    print(f"{Fore.RED}❌ {msg}")
+                    if progress_callback:
+                        progress_callback("Not Found", msg)
+                    return
+                if profile_info:
+                    is_private = bool(profile_info.get("is_private"))
+                    follows_viewer = bool(profile_info.get("followed_by_viewer") or profile_info.get("follows_viewer"))
+                    if is_private and not follows_viewer:
+                        msg = f"Profile {target} la private va cookie hien tai chua follow/khong co quyen xem."
+                        print(f"{Fore.RED}❌ {msg}")
+                        if progress_callback:
+                            progress_callback("Private", msg)
+                        return
+                elif profile_error:
+                    print(f"{Fore.YELLOW}⚠️  Khong kiem tra duoc profile qua web API: {profile_error}. Van thu bang Instaloader.")
+
+            print(f"{Fore.CYAN}📸 IG engine: Instaloader + browser cookie/header")
+            
+            if url_kind == "profile" and not self.get_ig_session():
+                msg = "Khong co session IG hop le nen khong quet profile/private."
+                print(f"{Fore.RED}❌ {msg}")
+                if progress_callback:
+                    progress_callback("Need Cookie", msg)
                 return
 
-        print(f"{Fore.MAGENTA}📸 Dang quet Instagram cua: {target}")
-        
-        try:
+            if url_kind == "post":
+                try:
+                    post = instaloader.Post.from_shortcode(self.ig.context, target)
+                    target = post.owner_username
+                except Exception as e:
+                    if self._is_ig_block_error(e):
+                        self._start_ig_cooldown(e)
+                    print(f"{Fore.RED}❌ Khong tim thay bai viet: {e}")
+                    return
+
+            print(f"{Fore.MAGENTA}📸 Dang quet Instagram cua: {target}")
+            
             ig_client = self._create_isolated_ig_client()
             ig_logged_in = ig_client.context.is_logged_in or self.ig_logged_in
             profile = None
-            for attempt, delay in enumerate(self.ig_profile_backoff, start=1):
-                try:
-                    profile = instaloader.Profile.from_username(ig_client.context, target)
-                    break
-                except Exception:
-                    if attempt == len(self.ig_profile_backoff):
-                        raise
-                    jitter = random.uniform(10, 25)
-                    total_wait = delay + jitter
-                    print(f"{Fore.YELLOW}⏳ IG chan tam thoi (401). Cho {total_wait:.1f}s roi thu lai...")
-                    time.sleep(total_wait)
+            try:
+                profile = instaloader.Profile.from_username(ig_client.context, target)
+            except Exception as e:
+                if self._is_ig_invalid_request_error(e):
+                    print(f"{Fore.RED}❌ IG tra ve 400 invalid request khi doc profile {target}. Cookie co the da het han/khong khop trinh duyet, hoac endpoint GraphQL hien tai khong chap nhan session nay. Khong cooldown vi day khong phai 429.")
+                    if progress_callback:
+                        progress_callback("Invalid Cookie", "IG trả 400 invalid request. Cập nhật lại Instagram Cookie rồi thử lại.")
+                    return
+                if self._is_ig_block_error(e):
+                    self._start_ig_cooldown(e)
+                    if progress_callback:
+                        progress_callback("Blocked", "Instagram bị 401/403. Đã bật cooldown, không retry liên tục.")
+                    return
+                if "does not exist" in str(e).lower() and url_kind == "profile":
+                    print(f"{Fore.RED}❌ Instagram khong cho doc profile {target}. Neu ban xem duoc trong trinh duyet, cookie trong Settings chua dung/het han hoac tai khoan cookie khong follow profile private nay.")
+                    if progress_callback:
+                        progress_callback("Need Cookie", "Cookie IG chua co quyen xem profile nay.")
+                    return
+                raise
 
             if profile is None:
                 return
@@ -766,12 +1395,9 @@ class MasterDownloader:
             os.makedirs(resolved_folder, exist_ok=True)
             ig_client.dirname_pattern = resolved_folder
 
-            # --- LOAD HISTORY (Added Feature) ---
-            # Ensure archive dir exists
-            os.makedirs(self.archive_dir, exist_ok=True)
-            
-            archive_filename = f"instagram_{target}.txt"
-            archive_path = os.path.join(self.archive_dir, archive_filename)
+            safe_target = self._sanitize_name(target, "instagram")
+            archive_path = self._archive_path(resolved_folder, "instagram", safe_target, "posts")
+            self._merge_archive_once(os.path.join(self.archive_dir, f"instagram_{target}.txt"), archive_path)
             
             print(f"{Fore.CYAN}📜 History File: {archive_path}")
             
@@ -789,78 +1415,88 @@ class MasterDownloader:
             # ------------------------------------
 
             # --- TẢI STORY (Added Feature) ---
-            print(f"{Fore.MAGENTA}🎞️  Dang quet & tai Stories...")
-            if progress_callback: progress_callback("Wait", "Đang quét Stories...")
-            try:
-                # Lay stories cua user hien tai (can login)
-                if ig_logged_in:
-                    stories = ig_client.get_stories(userids=[profile.userid])
-                    has_story = False
-                    for story in stories:
-                        for item in story.get_items():
-                            has_story = True
-                            
-                            # Check Metadata History (Story ID)
-                            story_id = str(item.mediaid)
-                            if story_id in downloaded_shortcodes:
-                                continue
+            if self.ig_download_stories:
+                print(f"{Fore.MAGENTA}🎞️  Dang quet & tai Stories...")
+                if progress_callback: progress_callback("Wait", "Đang quét Stories...")
+                try:
+                    # Lay stories cua user hien tai (can login)
+                    if ig_logged_in:
+                        stories = ig_client.get_stories(userids=[profile.userid])
+                        has_story = False
+                        for story in stories:
+                            for item in story.get_items():
+                                has_story = True
+                                
+                                # Check Metadata History (Story ID)
+                                story_id = str(item.mediaid)
+                                if story_id in downloaded_shortcodes:
+                                    continue
 
-                            # download_storyitem tra ve True neu tai moi
-                            downloaded = ig_client.download_storyitem(item, target=target)
-                            
-                            # Luu vao history
-                            if downloaded:
-                                print(f"{Fore.GREEN}   + Da tai story moi: {item.date_local}")
-                                try:
-                                    with open(archive_path, 'a', encoding='utf-8') as f:
-                                        f.write(f"{story_id}\n")
-                                    downloaded_shortcodes.add(story_id)
-                                except: pass
-                                time.sleep(random.uniform(2, 5))
-                            else:
-                                # Mark as downloaded if file exists but not in history
-                                # (Optional, but good for consistency)
-                                if story_id not in downloaded_shortcodes:
+                                # download_storyitem tra ve True neu tai moi
+                                downloaded = ig_client.download_storyitem(item, target=target)
+
+                                # Luu vao history
+                                if downloaded:
+                                    print(f"{Fore.GREEN}   + Da tai story moi: {item.date_local}")
                                     try:
                                         with open(archive_path, 'a', encoding='utf-8') as f:
                                             f.write(f"{story_id}\n")
                                         downloaded_shortcodes.add(story_id)
                                     except: pass
-                    
-                    if not has_story:
-                        print(f"{Fore.YELLOW}   ℹ️  Khong co story nao (hoac khong xem duoc).")
-                else:
-                    print(f"{Fore.YELLOW}   ⚠️  Chua login, bo qua quet Story.")
+                                    time.sleep(random.uniform(8, 20))
+                                else:
+                                    if story_id not in downloaded_shortcodes:
+                                        try:
+                                            with open(archive_path, 'a', encoding='utf-8') as f:
+                                                f.write(f"{story_id}\n")
+                                            downloaded_shortcodes.add(story_id)
+                                        except: pass
+                        
+                        if not has_story:
+                            print(f"{Fore.YELLOW}   ℹ️  Khong co story nao (hoac khong xem duoc).")
+                    else:
+                        print(f"{Fore.YELLOW}   ⚠️  Chua login, bo qua quet Story.")
 
-            except Exception as e:
-                print(f"{Fore.RED}   ❌ Khong the tai Story (co the do loi API hoac cookies): {e}")
+                except Exception as e:
+                    if self._is_ig_block_error(e):
+                        self._start_ig_cooldown(e)
+                        return
+                    print(f"{Fore.RED}   ❌ Khong the tai Story (co the do loi API hoac cookies): {e}")
+            else:
+                print(f"{Fore.YELLOW}🎞️  Bo qua Stories de giam nguy co IG 401/403.")
 
             # --- TẢI HIGHLIGHTS (Added Feature) ---
-            print(f"{Fore.MAGENTA}🌟 Dang quet & tai Highlights...")
-            try:
-                if ig_logged_in:
-                    highlights = ig_client.get_highlights(user=profile)
-                    has_highlight = False
-                    for highlight in highlights:
-                        print(f"{Fore.CYAN}   > Dang quet Highlight: {highlight.title}")
-                        for item in highlight.get_items():
-                            has_highlight = True
-                            if ig_client.download_storyitem(item, target=target):
-                                print(f"{Fore.GREEN}     + Da tai item trong highlight '{highlight.title}': {item.date_local}")
-                                time.sleep(random.uniform(2, 5))
-                    
-                    if not has_highlight:
-                        print(f"{Fore.YELLOW}   ℹ️  Khong co highlight nao.")
-                else:
-                    print(f"{Fore.YELLOW}   ⚠️  Chua login, bo qua quet Highlights.")
-            except Exception as e:
-                print(f"{Fore.RED}   ❌ Khong the tai Highlights: {e}")
+            if self.ig_download_highlights:
+                print(f"{Fore.MAGENTA}🌟 Dang quet & tai Highlights...")
+                try:
+                    if ig_logged_in:
+                        highlights = ig_client.get_highlights(user=profile)
+                        has_highlight = False
+                        for highlight in highlights:
+                            print(f"{Fore.CYAN}   > Dang quet Highlight: {highlight.title}")
+                            for item in highlight.get_items():
+                                has_highlight = True
+                                if ig_client.download_storyitem(item, target=target):
+                                    print(f"{Fore.GREEN}     + Da tai item trong highlight '{highlight.title}': {item.date_local}")
+                                    time.sleep(random.uniform(8, 20))
+                        
+                        if not has_highlight:
+                            print(f"{Fore.YELLOW}   ℹ️  Khong co highlight nao.")
+                    else:
+                        print(f"{Fore.YELLOW}   ⚠️  Chua login, bo qua quet Highlights.")
+                except Exception as e:
+                    if self._is_ig_block_error(e):
+                        self._start_ig_cooldown(e)
+                        return
+                    print(f"{Fore.RED}   ❌ Khong the tai Highlights: {e}")
+            else:
+                print(f"{Fore.YELLOW}🌟 Bo qua Highlights de giam nguy co IG 401/403.")
 
             # retry_on_401 = self.ig_retry_on_401  <-- Khong dung bien cuc bo nay nua, chuyen sang outer loop
             # wait_401_base = self.ig_wait_401_base
 
             # --- ROBUST LOOP: Bao ve ca qua trinh duyet iterator ---
-            outer_retries = 5 # Tang so lan thu lai vi loi 401 rat hay gap
+            outer_retries = 1
             post_count = 0
             while outer_retries > 0:
                 try:
@@ -908,7 +1544,7 @@ class MasterDownloader:
                                 break 
                         except Exception as inner_e:
                             print(f"\n{Fore.RED}❌ [Post {post_count}] Loi tai: {inner_e}")
-                            if "401" in str(inner_e) or "Unauthorized" in str(inner_e):
+                            if self._is_ig_block_error(inner_e):
                                 raise inner_e
                             continue
                     
@@ -918,34 +1554,29 @@ class MasterDownloader:
                 except Exception as e:
                     # Bat loi gay ra boi next(posts_iter) hoac raise 401 tu ben trong
                     msg = str(e)
-                    is_cnt_error = "Connection" in msg or "401" in msg or "Unauthorized" in msg or "few minutes" in msg
-                    
-                    if (is_cnt_error or "429" in msg) and outer_retries > 1:
-                        if "429" in msg:
-                            wait_time = 1800 + random.uniform(60, 180) # Force 30 min wait if 429
-                            print(f"{Fore.RED}🛑 IG báo lỗi 429 (Too Many Requests). Phải đợi {wait_time/60:.1f} phút...")
-                        else:
-                            wait_time = 300 + random.uniform(30, 90) # Doi 5-6 phut
-                            print(f"{Fore.YELLOW}⚠️  IG chan request (401/Network). Doi {wait_time:.0f}s roi quet lai tu dau...")
-                        
-                        time.sleep(wait_time)
-                        outer_retries -= 1
-                        print(f"{Fore.CYAN}🔄 Dang thu lai (lan {6 - outer_retries}/5)...")
-                        continue # Restart loop -> tao lai iterator moi
-                    else:
-                        print(f"{Fore.RED}❌ Loi nghiem trong hoac het luot thu: {e}")
+                    if self._is_ig_invalid_request_error(e):
+                        print(f"{Fore.RED}❌ IG tra ve 400 invalid request khi lay danh sach post. Hay copy lai Instagram Cookie moi tu dung tai khoan dang xem duoc profile nay.")
+                        if progress_callback:
+                            progress_callback("Invalid Cookie", "Cookie/session IG không được GraphQL chấp nhận.")
                         break
-        except Exception as e:
-            print(f"{Fore.RED}❌ Loi khi quet Profile: {e}")
+                    if self._is_ig_block_error(e):
+                        self._start_ig_cooldown(e)
+                        if progress_callback:
+                            progress_callback("Blocked", "Instagram bị 401/403/429. Đã dừng IG để tránh bị chặn nặng hơn.")
+                        break
+
+                    print(f"{Fore.RED}❌ Loi nghiem trong hoac het luot thu: {e}")
+                    break
 
     def download_facebook(self, url, output_folder=None, progress_callback=None):
         """Xử lý tải Facebook video/post"""
-        url = url.split('?')[0].strip()
-        match = re.search(r"facebook\.com/([^/?#]+)", url, re.IGNORECASE)
-        username = match.group(1) if match else "facebook"
+        url = url.strip()
+        username = self._extract_facebook_account_from_url(url)
+        if not username:
+            username = self._extract_ydl_account(url, "facebook")
 
         # Chi ho tro link video/watch/reel. Link profile se bi FB chan (yt_dlp khong lay duoc).
-        if not ("/videos/" in url or "/watch" in url or "/reel/" in url):
+        if not ("/videos/" in url or "/watch" in url or "/reel/" in url or "fb.watch/" in url):
             print(f"{Fore.RED}❌ Link Facebook nay khong phai video/post. Hay dan link /videos/, /watch?v=... hoac /reel/.")
             return
 
@@ -956,11 +1587,12 @@ class MasterDownloader:
              folder = self.resolve_folder("facebook", username, default_folder)
         os.makedirs(folder, exist_ok=True)
 
-        safe_name = "".join(c for c in username if c.isalnum() or c in ('-','_','.',' '))
-        archive = os.path.join(self.archive_dir, f"facebook_{safe_name}.txt")
+        safe_name = self._sanitize_name(username, "facebook")
+        archive = self._archive_path(folder, "facebook", safe_name, "ydl")
+        self._merge_archive_once(os.path.join(self.archive_dir, f"facebook_{safe_name}.txt"), archive)
 
         ydl_opts = {
-            'format': 'best',
+            'format': self._video_format(),
             'outtmpl': os.path.join(folder, '%(upload_date)s - %(title|No Title).150s [%(id)s].%(ext)s'),
             'download_archive': archive,
             'ignoreerrors': True,
@@ -974,77 +1606,149 @@ class MasterDownloader:
 
         print(f"{Fore.CYAN}🚀 Dang tai Facebook cua: {username}")
         if progress_callback: progress_callback("0%", "Đang lấy thông tin...")
-        with self._prepare_yt_dlp(ydl_opts, f"Facebook {username}") as ydl:
-            ydl.download([url])
 
-    def scan_for_duplicates(self, directory=None, remove=False, status_callback=None):
+        strategies = [("Browser Cookies", {'cookiesfrombrowser': ('edge',)}), ("No Cookies", {})]
+        last_error = None
+        for label, extra_opts in strategies:
+            opts = ydl_opts.copy()
+            opts.update(extra_opts)
+            try:
+                if label == "Browser Cookies":
+                    print(f"{Fore.CYAN}ℹ️  Dang thu lay cookie Facebook tu Edge...")
+                with self._prepare_yt_dlp(opts, f"Facebook {username}") as ydl:
+                    ydl.download([url])
+                return
+            except Exception as e:
+                last_error = e
+                err_msg = str(e)
+                is_cookie_error = "Permission denied" in err_msg or "CookieLoadError" in err_msg or "Could not copy" in err_msg
+                if is_cookie_error:
+                    print(f"{Fore.YELLOW}⚠️  Khong doc duoc cookie Edge cho Facebook. Thu tiep khong cookie...")
+                    continue
+                if "login" in err_msg.lower() or "private" in err_msg.lower():
+                    print(f"{Fore.YELLOW}⚠️  Facebook yeu cau dang nhap/cookie hop le cho link nay.")
+                    continue
+                print(f"{Fore.RED}❌ Loi Facebook voi {label}: {e}")
+                continue
+
+        if last_error:
+            raise last_error
+
+    def _media_extensions(self):
+        """Anh + video duoc tinh khi quet trung lap."""
+        return self._video_extensions() | {
+            '.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.heic', '.tiff', '.avif'
+        }
+
+    def _quick_signature(self, path, head=65536):
+        """Chu ky nhanh: doc 64KB dau de loc so bo truoc khi hash full."""
+        try:
+            with open(path, 'rb') as f:
+                return hashlib.blake2b(f.read(head), digest_size=16).hexdigest()
+        except OSError:
+            return None
+
+    def _file_hash(self, path, chunk=1 << 20):
+        """SHA-256 toan bo noi dung file (doc theo block 1MB)."""
+        h = hashlib.sha256()
+        try:
+            with open(path, 'rb') as f:
+                for block in iter(lambda: f.read(chunk), b''):
+                    h.update(block)
+        except OSError:
+            return None
+        return h.hexdigest()
+
+    def find_duplicates(self, directory=None, status_callback=None):
         """
-        Quét và tìm ảnh trùng lặp dựa trên nội dung (Perceptual Hashing).
-        :param directory: Thư mục cần quét. Nếu None, dùng thư mục hiện tại.
-        :param remove: Nếu True, sẽ xoá ảnh trùng (giữ lại 1 ảnh đầu tiên).
-        :param status_callback: Hàm callback(msg) để báo trạng thái scan.
-        :return: Danh sách các file trùng.
+        Tim file (anh + video) trung lap theo NOI DUNG (SHA-256), khong nham lan.
+        Toi uu: gom theo kich thuoc -> chu ky 64KB -> hash full, chi hash khi can.
+        :return: list cac nhom trung, moi nhom la list duong dan da sort theo mtime
+                 (phan tu [0] la file cu nhat = ban nen giu lai).
         """
-        duplicates = []
         if directory is None:
             directory = self.base_dir
-        
-        # Hàm in nội bộ có callback
+
         def log(msg):
-            # Strip color codes for callback if needed, but keeping simple for now
-            # App handles ANSI stripping or parsing
             print(msg)
             if status_callback:
                 status_callback(msg)
 
-        log(f"{Fore.CYAN}🔍 Bắt đầu quét ảnh trùng trong: {directory}...")
-        
-        hashes = {}
-        image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
-        
-        scanned_count = 0
-        
+        log(f"{Fore.CYAN}🔍 Bắt đầu quét file trùng (ảnh + video) trong: {directory}...")
+
+        media_exts = self._media_extensions()
+
+        # Buoc 1: gom theo kich thuoc (file unique size khong the trung)
+        size_map = {}
+        scanned = 0
         for root, _, files in os.walk(directory):
-            # Bỏ qua các thư mục hệ thống / cache của tool
-            if "sessions" in root or "__pycache__" in root or ".git" in root:
+            if "sessions" in root or "__pycache__" in root or ".git" in root or "archives" in root:
                 continue
-                
             for filename in files:
-                filepath = os.path.join(root, filename)
-                ext = os.path.splitext(filename)[1].lower()
-                
-                if ext in image_extensions:
-                    scanned_count += 1
-                    try:
-                        with Image.open(filepath) as img:
-                            # Tính hash trung bình (nhanh và đủ tốt cho trùng lặp gần như tuyệt đối)
-                            # Resize nhỏ để tính nhanh
-                            h = str(imagehash.average_hash(img))
-                            
-                            if h in hashes:
-                                original = hashes[h]
-                                duplicates.append((filepath, original))
-                                log(f"{Fore.YELLOW}⚠️  TRÙNG: {filename} giống với {os.path.basename(original)}")
-                                
-                                if remove:
-                                    try:
-                                        os.remove(filepath)
-                                        log(f"{Fore.RED}🗑️  Đã xoá bản sao: {filename}")
-                                    except Exception as e:
-                                        log(f"{Fore.RED}❌ Lỗi xoá {filename}: {e}")
-                            else:
-                                hashes[h] = filepath
-                    except Exception as e:
-                        # File lỗi hoặc không đọc được
-                        pass
-        
-        log(f"{Fore.GREEN}✅ Quét xong {scanned_count} ảnh.")
-        if len(duplicates) == 0:
-             log(f"{Fore.GREEN}✨ Không tìm thấy ảnh trùng nào.")
+                if os.path.splitext(filename)[1].lower() not in media_exts:
+                    continue
+                path = os.path.join(root, filename)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size == 0:
+                    continue
+                scanned += 1
+                size_map.setdefault(size, []).append(path)
+
+        log(f"{Fore.CYAN}📂 Đã quét {scanned} file media. Đang đối chiếu nội dung...")
+
+        # Buoc 2 + 3: trong moi nhom cung size -> loc theo chu ky 64KB -> hash full
+        groups = []
+        for size, paths in size_map.items():
+            if len(paths) < 2:
+                continue
+            quick_map = {}
+            for p in paths:
+                sig = self._quick_signature(p)
+                if sig is not None:
+                    quick_map.setdefault(sig, []).append(p)
+            for sig, candidates in quick_map.items():
+                if len(candidates) < 2:
+                    continue
+                full_map = {}
+                for p in candidates:
+                    fh = self._file_hash(p)
+                    if fh is not None:
+                        full_map.setdefault(fh, []).append(p)
+                for fh, dupes in full_map.items():
+                    if len(dupes) > 1:
+                        dupes.sort(key=lambda x: (os.path.getmtime(x), x))
+                        groups.append(dupes)
+                        log(f"{Fore.YELLOW}⚠️  Nhóm trùng ({len(dupes)} bản): {os.path.basename(dupes[0])}")
+
+        total_dupes = sum(len(g) - 1 for g in groups)
+        if total_dupes == 0:
+            log(f"{Fore.GREEN}✨ Không tìm thấy file trùng nào.")
         else:
-             log(f"{Fore.GREEN}♻️  Tổng cộng {len(duplicates)} ảnh trùng đã được xử lý.")
-             
-        return duplicates
+            log(f"{Fore.GREEN}✅ Tìm thấy {len(groups)} nhóm, {total_dupes} bản sao có thể xóa.")
+        return groups
+
+    def delete_paths(self, paths, status_callback=None):
+        """Xoa danh sach file, tra ve (so_file_da_xoa, tong_byte_giai_phong)."""
+        deleted = 0
+        freed = 0
+        for path in paths:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            try:
+                os.remove(path)
+                deleted += 1
+                freed += size
+                if status_callback:
+                    status_callback(f"🗑️  Đã xóa: {os.path.basename(path)}")
+            except Exception as e:
+                if status_callback:
+                    status_callback(f"❌ Lỗi xóa {os.path.basename(path)}: {e}")
+        return deleted, freed
 
     def run(self):
         self.clear_screen()
