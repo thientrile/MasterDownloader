@@ -317,11 +317,11 @@ class DuplicateWorker(QRunnable):
                 # We use row_id = -1 to indicate log-only progress
                 self.signals.progress.emit((-1, "0", "", msg))
 
-            results = self.downloader.find_duplicates(
+            groups, resurrected = self.downloader.find_duplicates(
                 directory=self.directory,
                 status_callback=callback
             )
-            self.signals.result.emit(results)
+            self.signals.result.emit((groups, resurrected))
         except:
             traceback.print_exc()
             exctype, value = sys.exc_info()[:2]
@@ -345,9 +345,10 @@ def human_size(num):
 # --- DUPLICATES REVIEW DIALOG ---
 class DuplicatesDialog(QDialog):
     """Hien thi cac nhom file trung, cho user chon ban nao xoa truoc khi xac nhan."""
-    def __init__(self, groups, parent=None):
+    def __init__(self, groups, parent=None, resurrected=None):
         super().__init__(parent)
         self.groups = groups
+        self.resurrected = resurrected or []
         self.setWindowTitle("Xử lý file trùng lặp")
         self.resize(860, 580)
         if parent:
@@ -357,8 +358,14 @@ class DuplicatesDialog(QDialog):
 
         total_dupes = sum(len(g) - 1 for g in groups)
         freed = sum(self._size(p) for g in groups for p in g[1:])
+        freed += sum(self._size(p) for p in self.resurrected)
+        resurrected_note = (
+            f" + <b>{len(self.resurrected)}</b> file đã từng xoá (tải lại)"
+            if self.resurrected else ""
+        )
         info = QLabel(
-            f"Tìm thấy <b>{len(groups)}</b> nhóm trùng, <b>{total_dupes}</b> bản sao "
+            f"Tìm thấy <b>{len(groups)}</b> nhóm trùng, <b>{total_dupes}</b> bản sao"
+            f"{resurrected_note} "
             f"(tối đa giải phóng <b>~{human_size(freed)}</b>).<br>"
             "Mục được <b>tick</b> sẽ bị <b>XÓA</b>. Mỗi nhóm tự giữ lại bản cũ nhất."
         )
@@ -417,6 +424,19 @@ class DuplicatesDialog(QDialog):
             kc.setForeground(0, QColor("#28a36a"))
 
             for p in group[1:]:
+                child = QTreeWidgetItem(top, [p, human_size(self._size(p)), self._mtime(p)])
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Checked)
+                child.setData(0, Qt.ItemDataRole.UserRole, p)
+
+        if self.resurrected:
+            top = QTreeWidgetItem(
+                self.tree,
+                [f"🔁 Đã từng xoá trước đây — {len(self.resurrected)} file", "", ""],
+            )
+            top.setFlags(top.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            top.setExpanded(True)
+            for p in self.resurrected:
                 child = QTreeWidgetItem(top, [p, human_size(self._size(p)), self._mtime(p)])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Checked)
@@ -1339,13 +1359,14 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.log(f"Lỗi khi quét file trùng: {err[1]}", "ERROR")
 
-    def handle_scan_result(self, groups):
-        if not groups:
+    def handle_scan_result(self, result):
+        groups, resurrected = result
+        if not groups and not resurrected:
             self.log("Quét xong. Không tìm thấy file trùng.", "SUCCESS")
             QMessageBox.information(self, "Hoàn tất", "Không tìm thấy file trùng nào.")
             return
 
-        dlg = DuplicatesDialog(groups, self)
+        dlg = DuplicatesDialog(groups, self, resurrected=resurrected)
         if not dlg.exec():
             self.log("Đã hủy xóa file trùng.", "INFO")
             return
