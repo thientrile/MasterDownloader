@@ -45,6 +45,9 @@ class MasterDownloader:
         # Thu muc luu lich su tai xuong (archives) de tranh trung lap
         self.archive_dir = os.path.join(self.data_dir, "archives")
         os.makedirs(self.archive_dir, exist_ok=True)
+        # So MD5 cac file da xoa vi trung, de chan tai lai (toan cuc)
+        self.deleted_md5_file = os.path.join(self.archive_dir, "deleted_md5.txt")
+        self._deleted_md5 = self._load_deleted_md5()
         # File luu lich su cau hinh thu muc theo platform/user
         self.history_file = os.path.join(self.data_dir, "history.json")
         self.ig = instaloader.Instaloader(
@@ -1648,9 +1651,49 @@ class MasterDownloader:
         except OSError:
             return None
 
+    def _load_deleted_md5(self):
+        """Nap so MD5 cac file da xoa: tra ve dict size(int) -> set(md5 hex)."""
+        registry = {}
+        path = getattr(self, "deleted_md5_file", None)
+        if not path or not os.path.exists(path):
+            return registry
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(",")
+                    if len(parts) != 2:
+                        continue
+                    md5, size_str = parts[0].strip(), parts[1].strip()
+                    try:
+                        size = int(size_str)
+                    except ValueError:
+                        continue
+                    if md5:
+                        registry.setdefault(size, set()).add(md5)
+        except OSError as e:
+            print(f"{Fore.YELLOW}⚠️  Khong doc duoc so MD5 {path!r}: {e}")
+        return registry
+
+    def _record_deleted_md5(self, md5, size):
+        """Ghi (md5,size) vao so neu chua co. Idempotent."""
+        if not md5:
+            return
+        known = self._deleted_md5.setdefault(size, set())
+        if md5 in known:
+            return
+        known.add(md5)
+        try:
+            with open(self.deleted_md5_file, "a", encoding="utf-8") as f:
+                f.write(f"{md5},{size}\n")
+        except OSError as e:
+            print(f"{Fore.YELLOW}⚠️  Khong ghi duoc so MD5 {self.deleted_md5_file!r}: {e}")
+
     def _file_hash(self, path, chunk=1 << 20):
-        """SHA-256 toan bo noi dung file (doc theo block 1MB)."""
-        h = hashlib.sha256()
+        """MD5 toan bo noi dung file (doc theo block 1MB)."""
+        h = hashlib.md5()
         try:
             with open(path, 'rb') as f:
                 for block in iter(lambda: f.read(chunk), b''):
@@ -1661,7 +1704,7 @@ class MasterDownloader:
 
     def find_duplicates(self, directory=None, status_callback=None):
         """
-        Tim file (anh + video) trung lap theo NOI DUNG (SHA-256), khong nham lan.
+        Tim file (anh + video) trung lap theo NOI DUNG (MD5), khong nham lan.
         Toi uu: gom theo kich thuoc -> chu ky 64KB -> hash full, chi hash khi can.
         :return: list cac nhom trung, moi nhom la list duong dan da sort theo mtime
                  (phan tu [0] la file cu nhat = ban nen giu lai).
@@ -1680,6 +1723,7 @@ class MasterDownloader:
 
         # Buoc 1: gom theo kich thuoc (file unique size khong the trung)
         size_map = {}
+        resurrected = []
         scanned = 0
         for root, _, files in os.walk(directory):
             if "sessions" in root or "__pycache__" in root or ".git" in root or "archives" in root:
@@ -1696,6 +1740,11 @@ class MasterDownloader:
                     continue
                 scanned += 1
                 size_map.setdefault(size, []).append(path)
+                # File "quay lai": size co trong so -> tinh MD5 -> doi chieu
+                if size in self._deleted_md5:
+                    fh = self._file_hash(path)
+                    if fh is not None and fh in self._deleted_md5[size]:
+                        resurrected.append(path)
 
         log(f"{Fore.CYAN}📂 Đã quét {scanned} file media. Đang đối chiếu nội dung...")
 
@@ -1724,14 +1773,18 @@ class MasterDownloader:
                         log(f"{Fore.YELLOW}⚠️  Nhóm trùng ({len(dupes)} bản): {os.path.basename(dupes[0])}")
 
         total_dupes = sum(len(g) - 1 for g in groups)
-        if total_dupes == 0:
+        # Tranh liet ke trung: bo resurrected da xuat hien trong groups
+        in_groups = {p for g in groups for p in g}
+        resurrected = [p for p in resurrected if p not in in_groups]
+        if total_dupes == 0 and not resurrected:
             log(f"{Fore.GREEN}✨ Không tìm thấy file trùng nào.")
         else:
-            log(f"{Fore.GREEN}✅ Tìm thấy {len(groups)} nhóm, {total_dupes} bản sao có thể xóa.")
-        return groups
+            log(f"{Fore.GREEN}✅ Tìm thấy {len(groups)} nhóm, {total_dupes} bản sao "
+                f"+ {len(resurrected)} file đã từng xoá.")
+        return groups, resurrected
 
     def delete_paths(self, paths, status_callback=None):
-        """Xoa danh sach file, tra ve (so_file_da_xoa, tong_byte_giai_phong)."""
+        """Xoa danh sach file, ghi MD5 vao so de chan tai lai. Tra ve (so_file_da_xoa, tong_byte)."""
         deleted = 0
         freed = 0
         for path in paths:
@@ -1739,6 +1792,10 @@ class MasterDownloader:
                 size = os.path.getsize(path)
             except OSError:
                 size = 0
+            # Ghi so MD5 truoc khi xoa (file con ton tai de tinh hash)
+            md5 = self._file_hash(path)
+            if md5 is not None and size > 0:
+                self._record_deleted_md5(md5, size)
             try:
                 os.remove(path)
                 deleted += 1
