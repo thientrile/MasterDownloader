@@ -436,7 +436,10 @@ class MasterDownloader:
         return [url]
 
     def _tiktok_url_kind(self, url):
-        path = urlparse(url if "://" in url else f"https://{url}").path.lower()
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        path = parsed.path.lower()
+        if parsed.netloc.lower() in {"vm.tiktok.com", "vt.tiktok.com"}:
+            return "short"
         if "/story/" in path or "/stories/" in path:
             return "story"
         if "/photo/" in path:
@@ -839,7 +842,7 @@ class MasterDownloader:
 
     def _video_format(self):
         """Tai video kem am thanh (merge bestvideo + bestaudio)."""
-        return 'bestvideo*+bestaudio/best'
+        return 'bestvideo+bestaudio/best[vcodec!=none][acodec!=none]'
 
     def _get_ffmpeg_exe(self):
         ffmpeg_path = shutil.which("ffmpeg")
@@ -902,6 +905,8 @@ class MasterDownloader:
         url = url.strip()
         if self._tiktok_url_kind(url) == "story":
             return self.download_tiktok_story(url, output_folder=output_folder, progress_callback=progress_callback)
+        if self._tiktok_url_kind(url) in {"photo", "short"}:
+            return self.download_tiktok_photo(url, output_folder=output_folder, progress_callback=progress_callback)
 
         candidate_urls = self._normalize_tiktok_url(url)
             
@@ -1007,6 +1012,57 @@ class MasterDownloader:
                 # Cac loi khac thi raise luon
                 print(f"{Fore.RED}❌ Loi TikTok: {e}")
                 raise e
+
+    def download_tiktok_photo(self, url, output_folder=None, progress_callback=None):
+        """Download every image and the audio track from a TikTok photo post."""
+        username = self._extract_tiktok_account_from_url(url) or "tiktok"
+        folder = output_folder or self.resolve_folder(
+            "tiktok", username, os.path.join(self.base_dir, username)
+        )
+        os.makedirs(folder, exist_ok=True)
+
+        cmd = [
+            sys.executable, "-m", "gallery_dl",
+            "--config-ignore",
+            "--no-input",
+            "--no-colors",
+            "--directory", folder,
+            "--download-archive", os.path.join(folder, ".masterdownloader_tiktok_gallerydl.sqlite3"),
+            "-o", "extractor.tiktok.photos=true",
+            "-o", "extractor.tiktok.audio=true",
+        ]
+        cookie = self.get_manual_cookie("tiktok")
+        cookie_file = self._create_temp_cookie_file(cookie, domain=".tiktok.com") if cookie else None
+        if cookie_file:
+            cmd.extend(["--cookies", cookie_file])
+        cmd.append(url)
+
+        if progress_callback:
+            progress_callback("0%", "TikTok gallery-dl đang tải ảnh...")
+        process = subprocess.Popen(
+            cmd,
+            cwd=self.base_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        last_line = ""
+        assert process.stdout is not None
+        for line in process.stdout:
+            last_line = line.rstrip()
+            if last_line:
+                print(last_line)
+                if progress_callback:
+                    progress_callback("Running", last_line[-160:])
+
+        code = process.wait()
+        if code:
+            raise RuntimeError(f"gallery-dl TikTok lỗi exit code {code}: {last_line}")
+        if progress_callback:
+            progress_callback("100%", "Đã tải xong ảnh TikTok.")
 
     def download_tiktok_story(self, url, output_folder=None, progress_callback=None):
         """TikTok story-only flow.
@@ -1222,7 +1278,8 @@ class MasterDownloader:
             "-o", "extractor.ytdl.forward-cookies=true",
             "-o", "extractor.ytdl.raw-options.no_color=true",
             "-o", "extractor.ytdl.raw-options.quiet=false",
-            "-o", "extractor.ytdl.format=bestvideo*+bestaudio/best",
+            "-o", f"extractor.ytdl.format={self._video_format()}",
+            "-o", "extractor.instagram.audio=true",
             "-o", f"extractor.instagram.include={include_modes}",
         ]
 
