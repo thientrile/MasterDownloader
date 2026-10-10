@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:40f456d7e6503ed8b1c83aa7b717b932abf4cd8c21f75c06a7ce5037bd941a38",
+  "claims": [
+    {
+      "id": "claim_ebabe9f4fae049808fdfccede770a59f",
+      "statement": "StartApp.sh creates or reuses .venv, installs requirements (upgrading when UPDATE_LIBS=1), selects a Qt platform under WSL, and launches App.py.",
+      "evidence": [
+        {
+          "resource": "repo://StartApp.sh",
+          "version": "repo-file-v1:sha256:a94bae211731e5fc6d2e18854726fad6972b3108709829483117f5816f8100f7"
+        }
+      ]
+    },
+    {
+      "id": "claim_ea40528c6bd84988bdc57db67065504e",
+      "statement": "UpdateLibs.sh upgrades pip and all requirements in .venv, then runs pip check and lists outdated packages.",
+      "evidence": [
+        {
+          "resource": "repo://UpdateLibs.sh",
+          "version": "repo-file-v1:sha256:04ea1d4fbc3323738c8569a231fd295737334a8ef085a5b844332dbdc5de2b85"
+        }
+      ]
+    },
+    {
+      "id": "claim_27689bbf17d74f629564471be0897867",
+      "statement": "MasterDownloader.py can run standalone as a console prompt loop via MasterDownloader().run().",
+      "evidence": [
+        {
+          "resource": "repo://MasterDownloader.py#L1810-L1848",
+          "version": "repo-lines-v1:sha256:6f063d0c4c44cebb1a985009ba1565ae3db8c6da88f9adda2cd9dc3afedfac37:eyJzZWxlY3RlZExpbmVDb3VudCI6MzksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFhZjBhOTQyZGIwMTYyOWE3MGQ4NGViZTU0Y2FlZGQwMzQyNjQxYTczZWQ4NzcwNjYxY2Q3YmQ1NTVjMDE2YzEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQxNGVmYTllZGVjYmM2ZTgxZWU3ZjE3MzI3MGU3NTI4MWM4ZjcwMTc4ZDhhZWQwMDBkNjgwYzlkNGI5ZmNjODMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFiNGIwZWQ4MzUyODk2NGQwNDE2NmZmZWQ5MGVmYjQ3NmNiNjUyZGZmOTdiM2QwOWViZTYwNDMwMDhhMTAzNGQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_6e41e9d3c707480caa5465274d6a7227",
+      "statement": "The project depends on yt-dlp, gallery-dl, instaloader, PyQt6, cryptography, browser-cookie3 and imageio-ffmpeg among others.",
+      "evidence": [
+        {
+          "resource": "repo://requirements.txt",
+          "version": "repo-file-v1:sha256:551074138e8fe84d9845c2a93a5fb029d6d4a59042523b4188645ffb5f476037"
+        }
+      ]
+    },
+    {
+      "id": "claim_9d794c7d4d914b6e997c71c295e12bc8",
+      "statement": "The test suite in tests/ uses unittest and covers the duplicate scanner, MD5 registry and duplicates dialog.",
+      "evidence": [
+        {
+          "resource": "repo://tests/test_dedup_dialog.py#L1-L33",
+          "version": "repo-lines-v1:sha256:bc5ed35350dcbbd9bed39441109a3824e187f5e54ef420c2b716beae02d2a550:eyJzZWxlY3RlZExpbmVDb3VudCI6MzMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM3MjdhZGZmNTI0ZTA2MTYwMjJlYWRkOGY0YWYyMWEwNzc4YjI5ZmM0Yzc3YmRmZWZkMWFmY2UyY2JmNWU0YjciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRlOTNkODkzOTA2ZWVhZjJjYWRjYzY1NTg1OTdiZDkzMzBlMmViNjlkZmI2MGE5YzgxNzUyMTg1MjdlNzI2ODEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        },
+        {
+          "resource": "repo://tests/test_dedup_md5.py#L1-L20",
+          "version": "repo-lines-v1:sha256:98434b48908d2e8ba882e7e2cd784b3889a5b703228524742c9ce03bbe53d9cd:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjNiM2VhM2NkYzcwNjhhOWU5N2NmY2RkYmNkOWQ4ZTBjNTRmZTRkMDY4MzQ3YjgwYjE1OGZkZDhiMTQ2NzZlM2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg4MWJlNzA4MzFiM2Y2N2U0OWMxYzc2Y2M1MDg4YmNlZThiZjdjYzRkZjY1NjkzNzBmYTE5YjE5NGVlOGUxMDEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImIzNjQ4NTEwZTE4NDdiZmI0OGE4M2ViYjZjOWZmZmQwMWM5YjA1MjAwOGI0ZDM2NGU3NTY5ZDQ5YzRiMGE3NWMifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.0",
+    "at": "2026-10-10T01:35:26.371Z"
+  }
+}

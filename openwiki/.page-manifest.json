@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "pages": {
+    "/openwiki/architecture/overview.md": {
+      "pageVersion": "sha256:3f432a4fdf1b41358edd54947ebb0b4a548e0949d45de0f8833c29df0a2c0cee",
+      "completedBy": "claude-code",
+      "completedRunId": "7c23a20d-622a-446d-906d-b337f1dc491b",
+      "gitHead": "c3a618b7f3aa21f6edf5dda57824eb93e3299565",
+      "sourceFingerprint": "sha256:2b4bff1148d48550e723a19924f8ed1528cfc900bfb1d321c61854e5e0552840"
+    },
+    "/openwiki/quickstart.md": {
+      "pageVersion": "sha256:40f456d7e6503ed8b1c83aa7b717b932abf4cd8c21f75c06a7ce5037bd941a38",
+      "completedBy": "claude-code",
+      "completedRunId": "7c23a20d-622a-446d-906d-b337f1dc491b",
+      "gitHead": "c3a618b7f3aa21f6edf5dda57824eb93e3299565",
+      "sourceFingerprint": "sha256:2b4bff1148d48550e723a19924f8ed1528cfc900bfb1d321c61854e5e0552840"
+    },
+    "/openwiki/workflows/duplicate-cleanup.md": {
+      "pageVersion": "sha256:019b9cd05357be88ec53f60cfc25efdb5669d049d0efe922fca4e0880ba009b9",
+      "completedBy": "claude-code",
+      "completedRunId": "7c23a20d-622a-446d-906d-b337f1dc491b",
+      "gitHead": "c3a618b7f3aa21f6edf5dda57824eb93e3299565",
+      "sourceFingerprint": "sha256:2b4bff1148d48550e723a19924f8ed1528cfc900bfb1d321c61854e5e0552840"
+    },
+    "/openwiki/workflows/platform-downloads.md": {
+      "pageVersion": "sha256:e860edbb9b72cc320b3e3214e3629cc32bf7c6a0435334df33e6bc955c1f448d",
+      "completedBy": "claude-code",
+      "completedRunId": "7c23a20d-622a-446d-906d-b337f1dc491b",
+      "gitHead": "c3a618b7f3aa21f6edf5dda57824eb93e3299565",
+      "sourceFingerprint": "sha256:2b4bff1148d48550e723a19924f8ed1528cfc900bfb1d321c61854e5e0552840"
+    }
+  }
+}
