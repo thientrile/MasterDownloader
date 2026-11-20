@@ -87,4 +87,5 @@ def cleanup_old(current_exe):
 
 
 def relaunch(current_exe):
-    subprocess.Popen([current_exe], close_fds=True)
+    # PyInstaller onefile >= 6.10: thieu bien nay thi ban moi dung lai thu muc _MEI (code cu) cua tien trinh cha
+    subprocess.Popen([current_exe], close_fds=True, env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})

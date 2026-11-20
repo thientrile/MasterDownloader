@@ -97,6 +97,16 @@ class SwapTest(unittest.TestCase):
             self.assertFalse(os.path.exists(old))
 
 
+class RelaunchTest(unittest.TestCase):
+    def test_relaunch_resets_pyinstaller_environment(self):
+        with mock.patch("updater.subprocess.Popen") as popen:
+            updater.relaunch(r"C:\\app\\MasterDownloader.exe")
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], [r"C:\\app\\MasterDownloader.exe"])
+        self.assertEqual(kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertIn("PATH", kwargs["env"])  # giu nguyen moi truong con lai
+
+
 class AppDataDirTest(unittest.TestCase):
     def test_source_run_keeps_base_dir(self):
         from MasterDownloader import app_data_dir
