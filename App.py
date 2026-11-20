@@ -1417,6 +1417,11 @@ class MainWindow(QMainWindow):
         QThreadPool.globalInstance().start(worker)
 
     def _on_update_installed(self, tag, exe, old):
+        if self.threadpool.activeThreadCount() > 0:
+            # Co luot tai bat dau trong luc tai ban moi: khong cat ngang, exe moi chay o lan mo sau
+            self.log(f"Đã cài {tag}; bản mới sẽ chạy khi bạn mở lại app.", "SUCCESS")
+            QMessageBox.information(self, "Cập nhật", f"Đã cài {tag}. Đang có lượt tải chạy nên app chưa khởi động lại;\nbản mới sẽ chạy khi bạn mở lại app.")
+            return
         try:
             updater.relaunch(exe)
         except OSError as e:
