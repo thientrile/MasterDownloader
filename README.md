@@ -1,0 +1,32 @@
+# MasterDownloader
+
+App desktop (PyQt6) tải video/ảnh từ TikTok, Instagram, Facebook, kèm quét và xoá file trùng (MD5).
+
+## Tải bản Windows
+
+Vào [Releases](../../releases), tải `MasterDownloader.exe`. Kiểm tra checksum (tuỳ chọn):
+
+```powershell
+Get-FileHash MasterDownloader.exe -Algorithm SHA256   # so với SHA256SUMS.txt
+```
+
+Dữ liệu (lịch sử, session, tài khoản IG đã mã hoá, `secret.key`) nằm cạnh file exe. `secret.key` được tạo riêng trên từng máy, không có trong repo và không có trong bản release.
+
+## Chạy từ source
+
+```bash
+./StartApp.sh        # Linux/WSL, tự tạo .venv
+StartApp.bat         # Windows
+```
+
+Test: `QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests`
+
+## Build và phát hành
+
+- `build.bat` build `dist\MasterDownloader.exe` (PyInstaller onefile), giống hệt CI.
+- Mỗi push/PR: GitHub Actions chạy test và build exe trên Windows (artifact `MasterDownloader-windows`).
+- Push tag `vX.Y.Z` tạo GitHub Release đính kèm `MasterDownloader.exe` và `SHA256SUMS.txt`:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```

@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: printf '__version__ = "%s"\n' "${GITHUB_REF_NAME#v}" > version.py
+
+      - name: Build exe
+        run: pyinstaller --noconfirm --onefile --windowed --name MasterDownloader --collect-submodules gallery_dl App.py
+
+      - name: Checksum
+        shell: bash
+        run: |
+          cd dist
+          sha256sum MasterDownloader.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MasterDownloader-windows
+          path: |
+            dist/MasterDownloader.exe
+            dist/SHA256SUMS.txt
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/MasterDownloader.exe dist/SHA256SUMS.txt --title "$GITHUB_REF_NAME" --generate-notes
