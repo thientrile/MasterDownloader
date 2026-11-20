@@ -20,7 +20,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtGui import QColor, QFont, QIcon, QAction
 
 # Import existing logic
-from MasterDownloader import MasterDownloader
+from MasterDownloader import MasterDownloader, app_data_dir
+import updater
 
 CRASH_LOG = None
 
@@ -491,7 +492,7 @@ class MainWindow(QMainWindow):
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.current_download_folder = self.base_dir
         
-        self.config_file = os.path.join(self.base_dir, "gui_config.json")
+        self.config_file = os.path.join(app_data_dir(self.base_dir), "gui_config.json")
         self.config = self.load_config()
 
         # Gioi han so luong tai dong thoi (doc tu config, mac dinh 3)
@@ -500,6 +501,10 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.load_saved_links()
+
+        if updater.can_self_update():
+            updater.cleanup_old(sys.executable)
+            QTimer.singleShot(3000, lambda: self.check_for_updates(manual=False))
 
     def load_config(self):
         default = {
@@ -821,6 +826,16 @@ class MainWindow(QMainWindow):
         grp_cookie_tt.setLayout(tt_layout)
         settings_layout.addWidget(grp_cookie_tt)
         
+        grp_update = QGroupBox("Cập nhật")
+        update_layout = QHBoxLayout()
+        update_layout.addWidget(QLabel(f"Phiên bản hiện tại: v{__version__}"))
+        update_layout.addStretch()
+        self.btn_check_update = QPushButton("Kiểm tra cập nhật")
+        self.btn_check_update.clicked.connect(lambda: self.check_for_updates(manual=True))
+        update_layout.addWidget(self.btn_check_update)
+        grp_update.setLayout(update_layout)
+        settings_layout.addWidget(grp_update)
+
         settings_layout.addStretch() # Push everything up
         
         tabs.addTab(tab_settings, "⚙️ Settings")
@@ -1338,6 +1353,78 @@ class MainWindow(QMainWindow):
             bar.setStyleSheet(PROGRESS_STYLE_ERROR)
         self.log(f"Error on row {row_id}: {value}", "ERROR")
         print(traceback_str)
+
+    def check_for_updates(self, manual=False):
+        if not updater.can_self_update():
+            if manual:
+                QMessageBox.information(self, "Cập nhật", "Tự cập nhật chỉ có ở bản exe Windows.")
+            return
+        if not manual and time.time() - self.config.get("last_update_check", 0) < 24 * 3600:
+            return
+        self.config["last_update_check"] = time.time()
+        self.save_config()
+        self.btn_check_update.setEnabled(False)
+        worker = DownloadWorker(lambda progress_callback: updater.check_latest(__version__), -1)
+        worker.signals.result.connect(lambda res: self._on_update_checked(res, manual))
+        worker.signals.error.connect(lambda err: self._on_update_error(err, manual))
+        worker.signals.finished.connect(lambda: self.btn_check_update.setEnabled(True))
+        # Pool rieng: self.threadpool chi dem luot tai
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_update_error(self, err, manual):
+        self.log(f"Không kiểm tra được cập nhật: {err[1]}", "WARNING")
+        if manual:
+            QMessageBox.warning(self, "Cập nhật", f"Không kiểm tra được cập nhật:\n{err[1]}")
+
+    def _on_update_checked(self, res, manual):
+        if not res:
+            if manual:
+                QMessageBox.information(self, "Cập nhật", f"Bạn đang dùng bản mới nhất (v{__version__}).")
+            return
+        tag, exe_url, sums_url = res
+        if not manual and self.config.get("skipped_version") == tag:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Có bản cập nhật")
+        box.setText(f"Đã có MasterDownloader {tag} (đang dùng v{__version__}).\nCập nhật bây giờ?")
+        btn_now = box.addButton("Cập nhật ngay", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Để sau", QMessageBox.ButtonRole.RejectRole)
+        btn_skip = box.addButton("Bỏ qua bản này", QMessageBox.ButtonRole.DestructiveRole)
+        box.exec()
+        if box.clickedButton() is btn_skip:
+            self.config["skipped_version"] = tag
+            self.save_config()
+        elif box.clickedButton() is btn_now:
+            self.install_update(tag, exe_url, sums_url)
+
+    def install_update(self, tag, exe_url, sums_url):
+        if self.threadpool.activeThreadCount() > 0:
+            QMessageBox.information(self, "Cập nhật", "Đang có lượt tải chạy. Hãy cập nhật sau khi tải xong.")
+            return
+        exe = sys.executable
+        new_exe = exe + ".new"
+        self.log(f"Đang tải bản cập nhật {tag}...", "INFO")
+        self.btn_check_update.setEnabled(False)
+
+        def work(progress_callback):
+            updater.download_verified(exe_url, sums_url, new_exe)
+            return updater.swap_exe(new_exe, exe)
+
+        worker = DownloadWorker(work, -1)
+        worker.signals.result.connect(lambda old: self._on_update_installed(tag, exe, old))
+        worker.signals.error.connect(lambda err: self._on_update_error(err, True))
+        worker.signals.finished.connect(lambda: self.btn_check_update.setEnabled(True))
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_update_installed(self, tag, exe, old):
+        try:
+            updater.relaunch(exe)
+        except OSError as e:
+            os.replace(old, exe)  # ban moi khong chay duoc: khoi phuc ban cu
+            QMessageBox.warning(self, "Cập nhật", f"Không khởi động được bản mới, đã giữ bản cũ:\n{e}")
+            return
+        self.log(f"Đã cập nhật lên {tag}, đang khởi động lại...", "SUCCESS")
+        QApplication.quit()
 
     def scan_duplicates_ui(self):
         # Chon thu muc can quet (uu tien thu muc tai mac dinh)
