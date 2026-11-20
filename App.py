@@ -8,6 +8,7 @@ import re
 import subprocess
 import shutil
 import faulthandler
+from version import __version__
 from urllib.parse import urlparse
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal, pyqtSlot, Qt, QTimer
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -469,7 +470,7 @@ class DuplicatesDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Master Downloader")
+        self.setWindowTitle(f"Master Downloader v{__version__}")
         self.resize(1180, 820)
         self.setMinimumSize(900, 620)
         
@@ -1390,6 +1391,11 @@ class MainWindow(QMainWindow):
             self.table.setItem(row_id, 4, QTableWidgetItem(text))
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--gallery-dl":
+        # Ban exe khong co python -m; MasterDownloader goi lai chinh exe voi co nay
+        import gallery_dl
+        sys.argv = ["gallery-dl"] + sys.argv[2:]
+        sys.exit(gallery_dl.main())
     enable_crash_logging()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
