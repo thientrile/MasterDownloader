@@ -28,6 +28,26 @@ if sys.stdout and sys.stdout.encoding != 'utf-8':
 # Khởi tạo màu sắc
 init(autoreset=True)
 
+USER_DATA = ("history.json", "gui_config.json", "secret.key", "ig_credentials.txt", "cookies.json", "sessions", "archives")
+
+
+def app_data_dir(base_dir):
+    """Ban exe Windows luu du lieu o %APPDATA%\\MasterDownloader (cap nhat exe khong dung toi, chay duoc trong Program Files).
+    Lan dau chuyen du lieu cu canh file exe sang. Chay tu source: giu canh App.py."""
+    appdata = os.environ.get("APPDATA")
+    if not (getattr(sys, "frozen", False) and sys.platform == "win32" and appdata):
+        return base_dir
+    target = os.path.join(appdata, "MasterDownloader")
+    os.makedirs(target, exist_ok=True)
+    for name in USER_DATA:
+        src, dst = os.path.join(base_dir, name), os.path.join(target, name)
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                shutil.move(src, dst)
+            except OSError as e:
+                print(f"Khong chuyen duoc {name} sang {target}: {e}")
+    return target
+
 class MasterDownloader:
     def __init__(self):
         # Determine if we are running in a bundle or a normal python environment
@@ -37,8 +57,7 @@ class MasterDownloader:
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
 
         # Thu muc du lieu chung (history, credentials, sessions)
-        self.data_dir = self.base_dir
-        # os.makedirs(self.data_dir, exist_ok=True) # Not needed if base_dir is root
+        self.data_dir = app_data_dir(self.base_dir)
         # Thu muc rieng de giu session, de de quan ly va xoa khi can
         self.session_dir = os.path.join(self.data_dir, "sessions")
         os.makedirs(self.session_dir, exist_ok=True)
