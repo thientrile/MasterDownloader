@@ -16,8 +16,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QFileDialog, QMessageBox, QProgressBar, QGroupBox, 
                              QPlainTextEdit, QLineEdit, QSplitter, QTabWidget, QFormLayout, QMenu,
                              QSpinBox, QProgressBar, QDialog, QTreeWidget, QTreeWidgetItem,
-                             QDialogButtonBox, QScrollArea, QFrame)
-from PyQt6.QtGui import QColor, QFont, QIcon, QAction
+                             QDialogButtonBox, QScrollArea, QFrame, QListWidget, QStackedWidget, QToolButton)
+from PyQt6.QtGui import QColor, QFont, QIcon, QAction, QDesktopServices
+from PyQt6.QtCore import QUrl
 
 # Import existing logic
 from MasterDownloader import MasterDownloader, app_data_dir
@@ -38,7 +39,7 @@ def enable_crash_logging():
 
 APP_STYLE = """
 QMainWindow {
-    background: #101418;
+    background: #0f1419;
     color: #e7edf3;
 }
 QWidget {
@@ -46,14 +47,50 @@ QWidget {
     font-family: "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif;
     font-size: 13px;
 }
+QListWidget#nav {
+    background: #0b0f13;
+    border: none;
+    border-right: 1px solid #222b34;
+    padding: 8px 6px;
+    outline: 0;
+}
+QListWidget#nav::item {
+    color: #8f9dab;
+    padding: 11px 12px;
+    border-radius: 7px;
+    margin: 2px 0;
+    font-weight: 600;
+}
+QListWidget#nav::item:selected {
+    background: #1d2a3a;
+    color: #f7fafc;
+}
+QListWidget#nav::item:hover:!selected {
+    background: #141b23;
+}
+QLabel#pageTitle {
+    font-size: 20px;
+    font-weight: 700;
+    color: #f7fafc;
+}
+QLabel#hint {
+    color: #8f9dab;
+}
+QToolButton#logToggle {
+    background: transparent;
+    border: none;
+    color: #a9b8c7;
+    font-weight: 650;
+    padding: 4px 0;
+}
 QTabWidget::pane {
     border: 1px solid #27313b;
     border-radius: 8px;
-    background: #141a20;
+    background: #161c23;
     top: -1px;
 }
 QTabBar::tab {
-    background: #101418;
+    background: #0f1419;
     color: #8f9dab;
     border: 1px solid #27313b;
     border-bottom: none;
@@ -64,11 +101,11 @@ QTabBar::tab {
     font-weight: 600;
 }
 QTabBar::tab:selected {
-    background: #141a20;
+    background: #161c23;
     color: #f7fafc;
 }
 QGroupBox {
-    background: #161d24;
+    background: #161c23;
     border: 1px solid #2b3642;
     border-radius: 8px;
     margin-top: 18px;
@@ -88,7 +125,7 @@ QLineEdit, QPlainTextEdit {
     border-radius: 7px;
     padding: 8px 10px;
     color: #edf3f9;
-    selection-background-color: #2f80ed;
+    selection-background-color: #3b82f6;
 }
 QLineEdit {
     min-height: 20px;
@@ -101,7 +138,7 @@ QLineEdit::placeholder, QPlainTextEdit::placeholder {
     color: #6f7d8b;
 }
 QFileDialog {
-    background: #141a20;
+    background: #161c23;
     color: #e7edf3;
 }
 QFileDialog QLabel {
@@ -112,7 +149,7 @@ QFileDialog QListView {
     background: #0f1419;
     color: #e7edf3;
     border: 1px solid #2c3742;
-    selection-background-color: #2f80ed;
+    selection-background-color: #3b82f6;
     selection-color: #ffffff;
     alternate-background-color: #151d25;
 }
@@ -144,28 +181,28 @@ QPushButton:disabled {
     color: #657383;
 }
 QPushButton#primaryButton {
-    background: #2f80ed;
-    border-color: #4b97f1;
+    background: #3b82f6;
+    border-color: #5b9bf8;
     color: #ffffff;
 }
 QPushButton#primaryButton:hover {
-    background: #3d8df7;
+    background: #4f8ff7;
 }
 QPushButton#warningButton {
-    background: #b96b16;
-    border-color: #d1842d;
+    background: #d97706;
+    border-color: #f59e0b;
     color: #fff8ed;
 }
 QPushButton#warningButton:hover {
-    background: #c97920;
+    background: #e8870a;
 }
 QPushButton#dangerButton {
-    background: #b8393f;
-    border-color: #d34d53;
+    background: #dc2626;
+    border-color: #ef4444;
     color: #fff5f5;
 }
 QPushButton#dangerButton:hover {
-    background: #ca444a;
+    background: #e23b3b;
 }
 QTableWidget {
     background: #11171d;
@@ -192,7 +229,7 @@ QProgressBar {
     min-height: 8px;
 }
 QProgressBar::chunk {
-    background: #2f80ed;
+    background: #3b82f6;
     border-radius: 4px;
 }
 QMenu {
@@ -243,15 +280,18 @@ QProgressBar {
     border: 1px solid #2a3641;
     border-radius: 5px;
     min-height: 8px;
+    margin: 7px 8px;
+    color: #dfe7ef;
+    font-size: 11px;
 }
 QProgressBar::chunk {
-    background: #2f80ed;
+    background: #3b82f6;
     border-radius: 4px;
 }
 """
 
-PROGRESS_STYLE_SUCCESS = PROGRESS_STYLE_DEFAULT.replace("#2f80ed", "#28a36a")
-PROGRESS_STYLE_ERROR = PROGRESS_STYLE_DEFAULT.replace("#2f80ed", "#d34d53")
+PROGRESS_STYLE_SUCCESS = PROGRESS_STYLE_DEFAULT.replace("#3b82f6", "#22c55e")
+PROGRESS_STYLE_ERROR = PROGRESS_STYLE_DEFAULT.replace("#3b82f6", "#ef4444")
 
 # --- WORKER SIGNALS ---
 class WorkerSignals(QObject):
@@ -423,7 +463,7 @@ class DuplicatesDialog(QDialog):
 
             kc = QTreeWidgetItem(top, [f"✅ GIỮ LẠI: {keeper}", human_size(self._size(keeper)), self._mtime(keeper)])
             kc.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            kc.setForeground(0, QColor("#28a36a"))
+            kc.setForeground(0, QColor("#22c55e"))
 
             for p in group[1:]:
                 child = QTreeWidgetItem(top, [p, human_size(self._size(p)), self._mtime(p)])
@@ -586,87 +626,90 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(APP_STYLE)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(18, 18, 18, 14)
-        main_layout.setSpacing(14)
+        root_layout = QHBoxLayout(central_widget)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        header_layout = QHBoxLayout()
-        title = QLabel("Master Downloader")
-        title.setStyleSheet("font-size: 18px; font-weight: 750; color: #f7fafc;")
-        header_layout.addWidget(title)
-        header_layout.addStretch()
+        # Thanh ben trai: ten app, dieu huong, phien ban
+        sidebar = QWidget()
+        sidebar.setFixedWidth(200)
+        sidebar.setStyleSheet("background: #0b0f13;")
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(12, 18, 12, 14)
+        side_layout.setSpacing(10)
+        brand = QLabel("Master\nDownloader")
+        brand.setStyleSheet("font-size: 17px; font-weight: 750; color: #f7fafc; padding-left: 6px;")
+        side_layout.addWidget(brand)
+        self.nav = QListWidget()
+        self.nav.setObjectName("nav")
+        self.nav.addItems(["⬇  Tải về", "⧉  Quét trùng", "⚙  Cài đặt"])
+        side_layout.addWidget(self.nav, 1)
+        version_label = QLabel(f"v{__version__}")
+        version_label.setObjectName("hint")
+        version_label.setStyleSheet("padding-left: 6px;")
+        side_layout.addWidget(version_label)
+        root_layout.addWidget(sidebar)
 
-        self.btn_window_minimize = QPushButton("Minimize")
-        self.btn_window_minimize.clicked.connect(self.showMinimized)
-        header_layout.addWidget(self.btn_window_minimize)
+        content = QWidget()
+        main_layout = QVBoxLayout(content)
+        main_layout.setContentsMargins(22, 18, 22, 12)
+        main_layout.setSpacing(12)
+        root_layout.addWidget(content, 1)
 
-        self.btn_window_maximize = QPushButton("Maximize")
-        self.btn_window_maximize.setObjectName("primaryButton")
-        self.btn_window_maximize.clicked.connect(self.toggle_window_size)
-        header_layout.addWidget(self.btn_window_maximize)
+        self.pages = QStackedWidget()
+        main_layout.addWidget(self.pages, 1)
+        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
 
-        main_layout.addLayout(header_layout)
-
-        # Tab Widget
-        tabs = QTabWidget()
-        main_layout.addWidget(tabs)
-
-        # --- TAB 1: DOWNLOADER ---
+        # --- TRANG 1: TAI VE ---
         tab_download = QWidget()
         download_layout = QVBoxLayout(tab_download)
-        download_layout.setContentsMargins(14, 14, 14, 14)
-        download_layout.setSpacing(14)
+        download_layout.setContentsMargins(0, 0, 0, 0)
+        download_layout.setSpacing(12)
+        title_dl = QLabel("Tải về")
+        title_dl.setObjectName("pageTitle")
+        download_layout.addWidget(title_dl)
 
         # 1. Top Control Panel
-        top_group = QGroupBox("Add Links")
+        top_group = QGroupBox("Thêm link")
         top_layout = QVBoxLayout()
         top_layout.setSpacing(12)
         
         # Row 1: URL input
         r1 = QHBoxLayout()
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Paste TikTok, Instagram, or Facebook link here...")
+        self.url_input.setPlaceholderText("Dán hoặc kéo thả link TikTok, Instagram, Facebook vào đây...")
         r1.addWidget(self.url_input)
         
-        self.btn_paste = QPushButton("Paste Clipboard")
+        self.btn_paste = QPushButton("Dán")
         self.btn_paste.clicked.connect(self.paste_from_clipboard)
         r1.addWidget(self.btn_paste)
         top_layout.addLayout(r1)
 
         # Row 2: Folder input
         r2 = QHBoxLayout()
-        r2.addWidget(QLabel("Save Folder (Optional):"))
+        r2.addWidget(QLabel("Thư mục lưu:"))
         self.folder_input = QLineEdit()
-        self.folder_input.setPlaceholderText("Default (Auto-create based on username)")
+        self.folder_input.setPlaceholderText("Mặc định: tự tạo theo tên tài khoản")
         r2.addWidget(self.folder_input)
         
-        btn_browse = QPushButton("Browse...")
+        btn_browse = QPushButton("Chọn…")
         btn_browse.clicked.connect(self.browse_folder)
         r2.addWidget(btn_browse)
         top_layout.addLayout(r2)
 
-        # Row 3: Buttons
-        r3 = QHBoxLayout()
-        self.btn_add = QPushButton("Download Now")
+        self.btn_add = QPushButton("Tải ngay")
         self.btn_add.setObjectName("primaryButton")
+        self.btn_add.setMinimumWidth(120)
         self.btn_add.clicked.connect(self.add_task)
-        r3.addWidget(self.btn_add)
-
-        r3.addSpacing(20)
-
-        self.btn_scan = QPushButton("Xóa file trùng")
-        self.btn_scan.setObjectName("warningButton")
-        self.btn_scan.clicked.connect(self.scan_duplicates_ui)
-        r3.addWidget(self.btn_scan)
-        
-        top_layout.addLayout(r3)
+        self.url_input.returnPressed.connect(self.add_task)
+        r1.addWidget(self.btn_add)
         top_group.setLayout(top_layout)
         download_layout.addWidget(top_group)
 
         # 2. Table Widget
         self.table = QTableWidget()
         self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["URL / ID", "Platform", "Save Folder", "Progress", "Status"])
+        self.table.setHorizontalHeaderLabels(["Link", "Nền tảng", "Thư mục lưu", "Tiến độ", "Trạng thái"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -680,21 +723,24 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        download_layout.addWidget(self.table)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_row_menu)
+        download_layout.addWidget(self.table, 1)
 
         row_actions = QHBoxLayout()
-        self.btn_download_selected = QPushButton("Download Selected")
+        self.btn_download_selected = QPushButton("Tải dòng đã chọn")
         self.btn_download_selected.setObjectName("primaryButton")
         self.btn_download_selected.setMinimumWidth(150)
         self.btn_download_selected.clicked.connect(self.download_selected_row)
         row_actions.addWidget(self.btn_download_selected)
 
-        self.btn_edit_selected_folder = QPushButton("Edit Folder")
+        self.btn_edit_selected_folder = QPushButton("Đổi thư mục")
         self.btn_edit_selected_folder.setMinimumWidth(110)
         self.btn_edit_selected_folder.clicked.connect(self.edit_row_folder)
         row_actions.addWidget(self.btn_edit_selected_folder)
 
-        self.btn_remove_selected = QPushButton("Remove Selected")
+        self.btn_remove_selected = QPushButton("Xoá khỏi danh sách")
         self.btn_remove_selected.setObjectName("dangerButton")
         self.btn_remove_selected.setMinimumWidth(140)
         self.btn_remove_selected.clicked.connect(self.remove_selected_row)
@@ -702,9 +748,36 @@ class MainWindow(QMainWindow):
         row_actions.addStretch()
         download_layout.addLayout(row_actions)
 
-        tabs.addTab(tab_download, "📥 Downloads")
+        self.pages.addWidget(tab_download)
 
-        # --- TAB 2: SETTINGS ---
+        # --- TRANG 2: QUET TRUNG ---
+        tab_scan = QWidget()
+        scan_layout = QVBoxLayout(tab_scan)
+        scan_layout.setContentsMargins(0, 0, 0, 0)
+        scan_layout.setSpacing(12)
+        title_scan = QLabel("Quét file trùng")
+        title_scan.setObjectName("pageTitle")
+        scan_layout.addWidget(title_scan)
+        scan_group = QGroupBox("Ảnh và video trùng nội dung")
+        scan_inner = QVBoxLayout()
+        hint_scan = QLabel("Chọn một thư mục để tìm các file trùng nội dung (so MD5). Bạn xem và chọn file cần xoá "
+                           "trước khi xoá. File đã xoá được ghi nhớ để không bị tải lại.")
+        hint_scan.setObjectName("hint")
+        hint_scan.setWordWrap(True)
+        scan_inner.addWidget(hint_scan)
+        self.btn_scan = QPushButton("Chọn thư mục và quét")
+        self.btn_scan.setObjectName("warningButton")
+        self.btn_scan.clicked.connect(self.scan_duplicates_ui)
+        scan_btn_row = QHBoxLayout()
+        scan_btn_row.addWidget(self.btn_scan)
+        scan_btn_row.addStretch()
+        scan_inner.addLayout(scan_btn_row)
+        scan_group.setLayout(scan_inner)
+        scan_layout.addWidget(scan_group)
+        scan_layout.addStretch()
+        self.pages.addWidget(tab_scan)
+
+        # --- TRANG 3: CAI DAT ---
         # Boc trong QScrollArea de noi dung khong bi nen/chong khi cao hon vung tab
         tab_settings = QWidget()
         tab_settings_outer = QVBoxLayout(tab_settings)
@@ -717,29 +790,32 @@ class MainWindow(QMainWindow):
         tab_settings_outer.addWidget(settings_scroll)
 
         settings_content = QWidget()
-        settings_content.setStyleSheet("background: #141a20;")  # khop nen tab pane
+        settings_content.setStyleSheet("background: #0f1419;")  # khop nen cua so
         settings_scroll.setWidget(settings_content)
         settings_layout = QVBoxLayout(settings_content)
-        settings_layout.setContentsMargins(14, 14, 14, 14)
-        settings_layout.setSpacing(14)
+        settings_layout.setContentsMargins(0, 0, 8, 0)
+        settings_layout.setSpacing(12)
+        title_settings = QLabel("Cài đặt")
+        title_settings.setObjectName("pageTitle")
+        settings_layout.addWidget(title_settings)
 
         # General Settings (Default Folder)
-        grp_general = QGroupBox("General Settings")
+        grp_general = QGroupBox("Chung")
         gen_layout = QVBoxLayout()
         
-        lbl_def = QLabel("Default Download Folder (for new/unknown users):")
+        lbl_def = QLabel("Thư mục tải mặc định (cho tài khoản mới):")
         gen_layout.addWidget(lbl_def)
         
         h_def = QHBoxLayout()
         self.txt_default_folder = QLineEdit()
-        self.txt_default_folder.setPlaceholderText("Select a folder to save videos from new users automatically...")
+        self.txt_default_folder.setPlaceholderText("Chọn thư mục lưu video của tài khoản mới...")
         h_def.addWidget(self.txt_default_folder)
         
-        btn_browse_def = QPushButton("Browse...")
+        btn_browse_def = QPushButton("Chọn…")
         btn_browse_def.clicked.connect(self.browse_default_folder)
         h_def.addWidget(btn_browse_def)
         
-        btn_save_def = QPushButton("Save Config")
+        btn_save_def = QPushButton("Lưu")
         btn_save_def.setObjectName("primaryButton")
         btn_save_def.clicked.connect(self.save_general_settings)
         h_def.addWidget(btn_save_def)
@@ -748,7 +824,7 @@ class MainWindow(QMainWindow):
 
         # Gioi han so luong tai dong thoi
         h_conc = QHBoxLayout()
-        h_conc.addWidget(QLabel("Số lượng tải đồng thời (Max concurrent downloads):"))
+        h_conc.addWidget(QLabel("Số lượt tải đồng thời:"))
         self.spin_max_concurrent = QSpinBox()
         self.spin_max_concurrent.setRange(1, 16)
         self.spin_max_concurrent.setValue(int(self.config.get("max_concurrent", 3)))
@@ -763,17 +839,17 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(grp_general)
 
         # IG Credentials Group
-        grp_ig = QGroupBox("Instagram Credentials (User/Pass)")
+        grp_ig = QGroupBox("Tài khoản Instagram")
         form_ig = QFormLayout()
         
         self.txt_ig_user = QLineEdit()
         self.txt_ig_pass = QLineEdit()
         self.txt_ig_pass.setEchoMode(QLineEdit.EchoMode.Password)
         
-        form_ig.addRow("Username:", self.txt_ig_user)
-        form_ig.addRow("Password:", self.txt_ig_pass)
+        form_ig.addRow("Tên đăng nhập:", self.txt_ig_user)
+        form_ig.addRow("Mật khẩu:", self.txt_ig_pass)
         
-        btn_save_ig = QPushButton("Save Credentials")
+        btn_save_ig = QPushButton("Lưu tài khoản")
         btn_save_ig.setObjectName("primaryButton")
         btn_save_ig.clicked.connect(self.save_ig_credentials)
         ig_btn_row = QHBoxLayout()
@@ -787,7 +863,7 @@ class MainWindow(QMainWindow):
         # IG Cookies
         grp_cookie_ig = QGroupBox("Instagram Cookie")
         ig_layout = QVBoxLayout()
-        ig_layout.addWidget(QLabel("Paste full 'Cookie' header string for Instagram:"))
+        ig_layout.addWidget(QLabel("Dán toàn bộ header 'Cookie' của Instagram:"))
         
         self.txt_cookie_ig = QPlainTextEdit()
         self.txt_cookie_ig.setPlaceholderText("csrftoken=...; ds_user_id=...; sessionid=...")
@@ -795,7 +871,7 @@ class MainWindow(QMainWindow):
         self.txt_cookie_ig.setMaximumHeight(180)
         ig_layout.addWidget(self.txt_cookie_ig)
         
-        btn_save_cookie_ig = QPushButton("Save Instagram Cookie")
+        btn_save_cookie_ig = QPushButton("Lưu cookie Instagram")
         btn_save_cookie_ig.setObjectName("primaryButton")
         btn_save_cookie_ig.clicked.connect(lambda: self.save_manual_cookie("instagram"))
         ig_btn_wrap = QHBoxLayout()
@@ -806,9 +882,9 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(grp_cookie_ig)
 
         # TikTok Cookies
-        grp_cookie_tt = QGroupBox("TikTok Cookie (For 429 Errors)")
+        grp_cookie_tt = QGroupBox("TikTok Cookie (khi bị lỗi 429)")
         tt_layout = QVBoxLayout()
-        tt_layout.addWidget(QLabel("Paste full 'Cookie' header string for TikTok:"))
+        tt_layout.addWidget(QLabel("Dán toàn bộ header 'Cookie' của TikTok:"))
         
         self.txt_cookie_tt = QPlainTextEdit()
         self.txt_cookie_tt.setPlaceholderText("tt_chain_token=...; ttwid=...; ...")
@@ -816,7 +892,7 @@ class MainWindow(QMainWindow):
         self.txt_cookie_tt.setMaximumHeight(180)
         tt_layout.addWidget(self.txt_cookie_tt)
         
-        btn_save_cookie_tt = QPushButton("Save TikTok Cookie")
+        btn_save_cookie_tt = QPushButton("Lưu cookie TikTok")
         btn_save_cookie_tt.setObjectName("primaryButton")
         btn_save_cookie_tt.clicked.connect(lambda: self.save_manual_cookie("tiktok"))
         tt_btn_wrap = QHBoxLayout()
@@ -838,11 +914,15 @@ class MainWindow(QMainWindow):
 
         settings_layout.addStretch() # Push everything up
         
-        tabs.addTab(tab_settings, "⚙️ Settings")
+        self.pages.addWidget(tab_settings)
+        self.nav.setCurrentRow(0)
 
-        # 3. Bottom Panel (Activity Log) - Shared across tabs
-        log_group = QGroupBox("Activity Log")
-        log_layout = QVBoxLayout()
+        # Nhat ky dung chung, thu gon mac dinh
+        self.btn_log_toggle = QToolButton()
+        self.btn_log_toggle.setObjectName("logToggle")
+        self.btn_log_toggle.setCheckable(True)
+        self.btn_log_toggle.toggled.connect(self.set_log_visible)
+        main_layout.addWidget(self.btn_log_toggle)
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumBlockCount(1500)
@@ -850,25 +930,50 @@ class MainWindow(QMainWindow):
         log_font.setStyleHint(QFont.StyleHint.Monospace)
         log_font.setPointSize(10)
         self.log_output.setFont(log_font)
-        log_layout.addWidget(self.log_output)
-        log_group.setLayout(log_layout)
-        
-        main_layout.addWidget(log_group)
-        
+        self.log_output.setFixedHeight(170)
+        main_layout.addWidget(self.log_output)
+        self.set_log_visible(False)
+
         # Status Bar
         self.status_bar = self.statusBar()
-        self.status_bar.showMessage("Ready")
+        self.status_bar.showMessage("Sẵn sàng")
+        self.setAcceptDrops(True)
 
         # Load Settings Data on Init
         self.load_settings_tab_data()
 
-    def toggle_window_size(self):
-        if self.isMaximized():
-            self.showNormal()
-            self.btn_window_maximize.setText("Maximize")
-        else:
-            self.showMaximized()
-            self.btn_window_maximize.setText("Restore")
+    def set_log_visible(self, visible):
+        self.log_output.setVisible(visible)
+        self.btn_log_toggle.setText(("▾" if visible else "▸") + "  Nhật ký")
+        if self.btn_log_toggle.isChecked() != visible:
+            self.btn_log_toggle.setChecked(visible)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText() or event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        text = mime.urls()[0].toString() if mime.hasUrls() else mime.text()
+        self.url_input.setText(text.strip())
+        self.nav.setCurrentRow(0)
+        self.url_input.setFocus()
+
+    def show_row_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        folder_item = self.table.item(row, 2)
+        folder = folder_item.text() if folder_item else ""
+        menu = QMenu(self)
+        menu.addAction("Tải", self.download_selected_row)
+        act_open = menu.addAction("Mở thư mục", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(folder)))
+        act_open.setEnabled(bool(folder) and os.path.isdir(folder))
+        menu.addAction("Đổi thư mục", self.edit_row_folder)
+        menu.addSeparator()
+        menu.addAction("Xoá khỏi danh sách", self.remove_selected_row)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def load_settings_tab_data(self):
         # Load Default Folder
@@ -913,7 +1018,7 @@ class MainWindow(QMainWindow):
         folder = self.txt_default_folder.text().strip()
         self.config["default_download_folder"] = folder
         self.save_config()
-        QMessageBox.information(self, "Saved", "General settings saved successfully.")
+        QMessageBox.information(self, "Đã lưu", "Đã lưu cài đặt chung.")
         self.log(f"Default download folder updated to: {folder}", "SUCCESS")
 
     def on_max_concurrent_changed(self, value):
@@ -926,11 +1031,11 @@ class MainWindow(QMainWindow):
         user = self.txt_ig_user.text().strip()
         pwd = self.txt_ig_pass.text().strip()
         if not user or not pwd:
-            QMessageBox.warning(self, "Missing Info", "Please enter both username and password.")
+            QMessageBox.warning(self, "Thiếu thông tin", "Hãy nhập cả tên đăng nhập và mật khẩu.")
             return
             
         self.downloader.save_credentials(user, pwd)
-        QMessageBox.information(self, "Saved", "Instagram credentials saved successfully.")
+        QMessageBox.information(self, "Đã lưu", "Đã lưu tài khoản Instagram.")
         self.log("Instagram credentials updated.", "SUCCESS")
 
     def save_manual_cookie(self, platform):
@@ -944,10 +1049,10 @@ class MainWindow(QMainWindow):
              return
 
         if self.downloader.set_manual_cookie(platform, cookie):
-            QMessageBox.information(self, "Saved", f"{label} cookie saved successfully.")
+            QMessageBox.information(self, "Đã lưu", f"Đã lưu cookie {label}.")
             self.log(f"{label} cookie updated.", "SUCCESS")
         else:
-            QMessageBox.critical(self, "Error", f"Failed to save {label} cookie.")
+            QMessageBox.critical(self, "Lỗi", f"Không lưu được cookie {label}.")
 
 
     def paste_from_clipboard(self):
@@ -957,7 +1062,9 @@ class MainWindow(QMainWindow):
     def log(self, message, level="INFO"):
         timestamp = time.strftime("%H:%M:%S")
         color = "#d4d4d4" # INFO
-        if level == "ERROR": color = "#ff5555"
+        if level == "ERROR":
+            color = "#ff5555"
+            self.set_log_visible(True)
         if level == "SUCCESS": color = "#50fa7b"
         
         html = f'<span style="color: #6272a4;">[{timestamp}]</span> <span style="font-weight:bold; color:{color};">[{level}]</span> {message}'
@@ -981,9 +1088,9 @@ class MainWindow(QMainWindow):
             elif "facebook" in url: platform = "Facebook"
             elif "instagram" in url: platform = "Instagram"
             
-            self.add_table_row(url, platform, folder, auto_start=False, status="History")
+            self.add_table_row(url, platform, folder, auto_start=False, status="Đã lưu")
 
-    def add_table_row(self, url, platform, folder="", auto_start=True, status="Queued"):
+    def add_table_row(self, url, platform, folder="", auto_start=True, status="Đang chờ"):
         row = self.table.rowCount()
         self.table.insertRow(row)
         
@@ -999,9 +1106,10 @@ class MainWindow(QMainWindow):
         # Col 3: Progress (thanh tien trinh that cho moi file/dong)
         pbar = QProgressBar()
         pbar.setRange(0, 100)
-        pbar.setValue(100 if status == "Completed" else 0)
+        pbar.setValue(100 if status == "Hoàn tất" else 0)
         pbar.setTextVisible(True)
         pbar.setFormat("%p%")
+        pbar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         pbar.setStyleSheet(PROGRESS_STYLE_DEFAULT)
         self.table.setCellWidget(row, 3, pbar)
 
@@ -1051,8 +1159,8 @@ class MainWindow(QMainWindow):
     def delete_task_by_url(self, url, confirm=True):
         # Confirm
         if confirm:
-            answer = QMessageBox.question(self, "Remove Link",
-                                        f"Remove this link from list?\n{url}",
+            answer = QMessageBox.question(self, "Xoá link",
+                                        f"Xoá link này khỏi danh sách?\n{url}",
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -1238,7 +1346,7 @@ class MainWindow(QMainWindow):
         self.log(f"Preparing download: {platform} | {url}", "INFO")
 
         # Change button to "Running" or disable it
-        self.update_status(row_id, "Queued")
+        self.update_status(row_id, "Đang chờ")
 
         # Reset thanh tien trinh ve 0 + style mac dinh (truong hop tai lai)
         self.failed_rows.discard(row_id)
@@ -1321,7 +1429,7 @@ class MainWindow(QMainWindow):
         self._set_row_progress(row_id, pct)
 
         # Update Status Column
-        self.table.setItem(row_id, 4, QTableWidgetItem("Downloading"))
+        self.table.setItem(row_id, 4, QTableWidgetItem("Đang tải"))
 
         # Thanh tien trinh ASCII trong log (throttle theo buoc 10% de tranh spam)
         if pct is not None:
@@ -1336,7 +1444,7 @@ class MainWindow(QMainWindow):
         if row_id in self.failed_rows:
             self.failed_rows.discard(row_id)
             return
-        self.update_status(row_id, "Completed")
+        self.update_status(row_id, "Hoàn tất")
         self._set_row_progress(row_id, 100)
         bar = self.table.cellWidget(row_id, 3) if row_id < self.table.rowCount() else None
         if isinstance(bar, QProgressBar):
@@ -1347,7 +1455,7 @@ class MainWindow(QMainWindow):
         self._log_pct_bucket.pop(row_id, None)
         self.failed_rows.add(row_id)
         exctype, value, traceback_str = err_info
-        self.update_status(row_id, "Error")
+        self.update_status(row_id, "Lỗi")
         bar = self.table.cellWidget(row_id, 3) if row_id < self.table.rowCount() else None
         if isinstance(bar, QProgressBar):
             bar.setStyleSheet(PROGRESS_STYLE_ERROR)
