@@ -221,6 +221,10 @@ class MasterDownloader:
         try:
             return self.cipher.decrypt(text.encode('utf-8')).decode('utf-8')
         except Exception:
+            if text.startswith("gAAAA"):
+                # Ma hoa bang secret.key khac (vd. khoa da doi): khong tra ve ban ma nhu mat khau/cookie
+                print(f"{Fore.YELLOW}⚠️  Khong giai ma duoc du lieu da luu (secret.key da doi). Hay nhap lai tai khoan/cookie.")
+                return ""
             # Fallback if text is not encrypted (migration support)
             return text
 
@@ -1206,7 +1210,8 @@ class MasterDownloader:
             print(f"{Fore.YELLOW}⚠️  Khong co Instagram Cookie. gallery-dl van se thu tai, nhung profile/private/stories co the bi han che.")
 
         cmd = [
-            sys.executable, "-m", "gallery_dl",
+            # Ban exe: sys.executable la chinh app, App.py chuyen tiep --gallery-dl sang gallery_dl
+            *([sys.executable, "--gallery-dl"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "gallery_dl"]),
             "--config-ignore",
             "--no-input",
             "--no-colors",
