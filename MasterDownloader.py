@@ -28,6 +28,26 @@ if sys.stdout and sys.stdout.encoding != 'utf-8':
 # Khởi tạo màu sắc
 init(autoreset=True)
 
+USER_DATA = ("history.json", "gui_config.json", "secret.key", "ig_credentials.txt", "cookies.json", "sessions", "archives")
+
+
+def app_data_dir(base_dir):
+    """Ban exe Windows luu du lieu o %APPDATA%\\MasterDownloader (cap nhat exe khong dung toi, chay duoc trong Program Files).
+    Lan dau chuyen du lieu cu canh file exe sang. Chay tu source: giu canh App.py."""
+    appdata = os.environ.get("APPDATA")
+    if not (getattr(sys, "frozen", False) and sys.platform == "win32" and appdata):
+        return base_dir
+    target = os.path.join(appdata, "MasterDownloader")
+    os.makedirs(target, exist_ok=True)
+    for name in USER_DATA:
+        src, dst = os.path.join(base_dir, name), os.path.join(target, name)
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                shutil.move(src, dst)
+            except OSError as e:
+                print(f"Khong chuyen duoc {name} sang {target}: {e}")
+    return target
+
 class MasterDownloader:
     def __init__(self):
         # Determine if we are running in a bundle or a normal python environment
@@ -37,8 +57,9 @@ class MasterDownloader:
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
 
         # Thu muc du lieu chung (history, credentials, sessions)
-        self.data_dir = self.base_dir
-        # os.makedirs(self.data_dir, exist_ok=True) # Not needed if base_dir is root
+        self.data_dir = app_data_dir(self.base_dir)
+        # Thu muc tai khi chua cau hinh: khong ghi canh exe (Program Files khong ghi duoc)
+        self.download_root = os.path.join(os.path.expanduser("~"), "Downloads", "MasterDownloader")
         # Thu muc rieng de giu session, de de quan ly va xoa khi can
         self.session_dir = os.path.join(self.data_dir, "sessions")
         os.makedirs(self.session_dir, exist_ok=True)
@@ -609,7 +630,7 @@ class MasterDownloader:
         # Chuan hoa: neu folder cu dang TikTok_username hoac IG_username thi doi ve username thuan
         basename = os.path.basename(folder)
         if (basename.startswith("TikTok_") or basename.startswith("IG_")) and basename.endswith(username):
-            folder = os.path.join(self.base_dir, username)
+            folder = os.path.join(os.path.dirname(folder), username)
 
         # Luu lai mapping moi
         self.history[key] = {"folder": folder}
@@ -917,7 +938,7 @@ class MasterDownloader:
         if output_folder:
              folder = output_folder
         else:
-             default_folder = os.path.join(self.base_dir, username)
+             default_folder = os.path.join(self.download_root, username)
              folder = self.resolve_folder("tiktok", username, default_folder)
         os.makedirs(folder, exist_ok=True)
             
@@ -1028,7 +1049,7 @@ class MasterDownloader:
         if output_folder:
             folder = output_folder
         else:
-            default_folder = os.path.join(self.base_dir, username)
+            default_folder = os.path.join(self.download_root, username)
             folder = self.resolve_folder("tiktok", username, default_folder)
         os.makedirs(folder, exist_ok=True)
 
@@ -1106,7 +1127,7 @@ class MasterDownloader:
         if output_folder:
             folder = output_folder
         else:
-            default_folder = os.path.join(self.base_dir, target or "instagram")
+            default_folder = os.path.join(self.download_root, target or "instagram")
             folder = self.resolve_folder("instagram", target or "instagram", default_folder)
         os.makedirs(folder, exist_ok=True)
 
@@ -1190,7 +1211,7 @@ class MasterDownloader:
         if output_folder:
             folder = output_folder
         else:
-            default_folder = os.path.join(self.base_dir, target)
+            default_folder = os.path.join(self.download_root, target)
             folder = self.resolve_folder("instagram", target, default_folder)
         os.makedirs(folder, exist_ok=True)
 
@@ -1398,7 +1419,7 @@ class MasterDownloader:
             if output_folder:
                 resolved_folder = output_folder
             else:
-                default_folder = os.path.join(self.base_dir, target)
+                default_folder = os.path.join(self.download_root, target)
                 resolved_folder = self.resolve_folder("instagram", target, default_folder)
             os.makedirs(resolved_folder, exist_ok=True)
             ig_client.dirname_pattern = resolved_folder
@@ -1591,7 +1612,7 @@ class MasterDownloader:
         if output_folder:
              folder = output_folder
         else:
-             default_folder = os.path.join(self.base_dir, username)
+             default_folder = os.path.join(self.download_root, username)
              folder = self.resolve_folder("facebook", username, default_folder)
         os.makedirs(folder, exist_ok=True)
 
