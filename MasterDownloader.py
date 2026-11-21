@@ -1039,7 +1039,14 @@ class MasterDownloader:
 
     def _gallerydl_cmd(self):
         # Ban exe: sys.executable la chinh app, App.py chuyen tiep --gallery-dl sang gallery_dl
-        return [sys.executable, "--gallery-dl"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "gallery_dl"]
+        cmd = [sys.executable, "--gallery-dl"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "gallery_dl"]
+        # yt-dlp ben trong gallery-dl chi tim ffmpeg tren PATH (Windows thuong khong co):
+        # khong ghep duoc video DASH + audio -> video mat tieng. Dua ffmpeg cua app vao.
+        ffmpeg = self._get_ffmpeg_exe()
+        if ffmpeg:
+            for scope in ("downloader", "extractor"):
+                cmd += ["-o", f"{scope}.ytdl.raw-options.ffmpeg_location={ffmpeg}"]
+        return cmd
 
     def _run_gallerydl(self, cmd, progress_callback=None):
         """Chay gallery-dl, in log ra console/progress. Tra ve (exit code, cac dong output)."""
