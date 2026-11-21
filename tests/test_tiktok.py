@@ -120,10 +120,18 @@ class GalleryDlFlowTest(unittest.TestCase):
         self.assertEqual(calls[1][-1], post)
         self.assertEqual(progress[-1], "100%")
 
-    def test_profile_without_stories_reports_clearly(self):
+    def test_profile_without_stories_raises_for_gui(self):
         stories = "https://www.tiktok.com/@chang18102003/stories"
-        _, progress = self._download(stories, stories, [(0, ["[tiktok][info] No results for " + stories])])
-        self.assertEqual(progress[-1], "Error")
+        with self.assertRaisesRegex(RuntimeError, "Không có story"):
+            self._download(stories, stories, [(0, ["[tiktok][info] No results for " + stories])])
+
+    def test_other_errors_survive_successful_retry(self):
+        post = "https://www.tiktok.com/@chang18102003/video/1"
+        fail = f"[tiktok][error] {post}: Failed to extract post (HttpError: '403 Forbidden' for '{post}')"
+        other = "[download][error] Failed to download STORY - 2.mp4"
+        stories = "https://www.tiktok.com/@chang18102003/stories"
+        with self.assertRaisesRegex(RuntimeError, "STORY - 2"):
+            self._download(stories, stories, [(4, [fail, other]), (0, ["ok"])])
 
 
 if __name__ == "__main__":

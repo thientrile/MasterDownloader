@@ -1106,14 +1106,20 @@ class MasterDownloader:
 
         # Sau khi goi API danh sach story, TikTok tra 403 cho trang tung bai trong cung phien;
         # chay lai cac link do trong tien trinh moi thi tai duoc.
-        retry_urls = []
+        retry_urls, other_errors = [], []
         for line in lines:
             m = re.search(r"Failed to extract post \(HttpError: '403[^']*' for '([^']+)'", line)
-            if m and m.group(1) not in retry_urls:
-                retry_urls.append(m.group(1))
+            if m:
+                if m.group(1) not in retry_urls:
+                    retry_urls.append(m.group(1))
+            elif "][error]" in line:
+                other_errors.append(line)
         if retry_urls:
             print(f"{Fore.YELLOW}⚠️  TikTok tra 403 cho {len(retry_urls)} bai, dang thu lai...")
             code, lines = self._run_gallerydl(cmd + retry_urls, progress_callback)
+            if other_errors:
+                # Loi ngoai nhom 403 khong duoc chay lai: van tinh la that bai
+                code, lines = code or 1, lines + other_errors
 
         output = "\n".join(lines).lower()
         if code == 0 and "no results for" not in output:
@@ -1131,6 +1137,9 @@ class MasterDownloader:
         print(f"{Fore.GREEN if status == '100%' else Fore.RED}{msg}")
         if progress_callback:
             progress_callback(status, msg)
+        if status != "100%":
+            # GUI chi danh dau "Lỗi" khi ham nem exception
+            raise RuntimeError(msg)
 
     def download_instagram_with_ytdlp(self, url, target, output_folder=None, progress_callback=None):
         """Try yt-dlp first for Instagram to avoid Instaloader GraphQL profile lookups."""
